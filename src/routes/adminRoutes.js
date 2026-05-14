@@ -70,14 +70,24 @@ router.get('/settings', async (req, res) => {
 });
 
 // --- Update App Settings API ---
+// --- Update App Settings API ---
 router.post('/settings', async (req, res) => {
-  const { categories, pricing } = req.body;
-  const settings = await Settings.findOneAndUpdate(
-    { key: 'app_settings' },
-    { categories, pricing },
-    { new: true, upsert: true }
-  );
-  res.json({ success: true, message: 'Settings securely updated!', settings });
+  try {
+    const { categories, pricing } = req.body;
+    
+    const settings = await Settings.findOneAndUpdate(
+      { key: 'app_settings' },
+      { categories, pricing },
+      { new: true, upsert: true }
+    );
+    
+    res.json({ success: true, message: 'Settings securely updated!', settings });
+    
+  } catch (error) {
+    // Ye line error ko dhar-dabocha kar Render par print karegi!
+    console.error("🔥 BHOOT PAKDA GAYA (SETTINGS ERROR):", error);
+    res.status(500).json({ success: false, message: error.message });
+  }
 });
 
 module.exports = router;
