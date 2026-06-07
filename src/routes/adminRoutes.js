@@ -8,7 +8,7 @@ const mongoose = require('mongoose');
 const seedAdmin = async () => {
   try {
     // 🚨 Purane sabhi aade-tirche admin accounts delete kardo
-    await Admin.deleteMany({}); 
+    await Admin.deleteMany({});
     // Ekdum fresh account banao
     await Admin.create({ username: 'admin', password: 'password123' });
     console.log('✅ Admin ID FORCE RESET -> Username: admin | Password: password123');
@@ -40,14 +40,14 @@ router.post('/login', async (req, res) => {
 router.post('/change-credentials', async (req, res) => {
   const { oldPassword, newUsername, newPassword } = req.body;
   const admin = await Admin.findOne({ password: oldPassword });
-  
+
   if (!admin) {
     return res.status(401).json({ success: false, message: 'Purana password galat hai!' });
   }
 
   if (newUsername) admin.username = newUsername;
   if (newPassword) admin.password = newPassword;
-  
+
   await admin.save();
   res.json({ success: true, message: 'Credentials successfully updated!' });
 });
@@ -58,7 +58,7 @@ const seedSettings = async () => {
   try {
     const count = await Settings.countDocuments();
     if (count === 0) await Settings.create({});
-  } catch (err) {}
+  } catch (err) { }
 };
 if (mongoose.connection.readyState === 1) seedSettings();
 else mongoose.connection.once('open', seedSettings);
@@ -73,16 +73,16 @@ router.get('/settings', async (req, res) => {
 // --- Update App Settings API ---
 router.post('/settings', async (req, res) => {
   try {
-    const { categories, pricing } = req.body;
-    
+    const { categories, facilities, pricing } = req.body;
+
     const settings = await Settings.findOneAndUpdate(
       { key: 'app_settings' },
-      { categories, pricing },
+      { categories, facilities, pricing },
       { new: true, upsert: true }
     );
-    
+
     res.json({ success: true, message: 'Settings securely updated!', settings });
-    
+
   } catch (error) {
     // Ye line error ko dhar-dabocha kar Render par print karegi!
     console.error("🔥 BHOOT PAKDA GAYA (SETTINGS ERROR):", error);

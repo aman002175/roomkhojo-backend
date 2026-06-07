@@ -3,24 +3,57 @@ const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
 const morgan = require('morgan');
-
-// 🚨 NAYE SECURITY GUARDS IMPORTS
 const rateLimit = require('express-rate-limit');
 const mongoSanitize = require('express-mongo-sanitize');
-const xss = require('xss-clean');
 
 const connectDB = require('./config/db'); 
 
 const app = express();
 
+// 🚨 EXPRESS 5 QUERY PATCH: Shadows the read-only req.query prototype getter with a writable instance property
+// so that legacy middleware (like express-mongo-sanitize) can mutate it safely.
+app.use((req, res, next) => {
+  if (req.query) {
+    Object.defineProperty(req, 'query', {
+      value: req.query,
+      writable: true,
+      configurable: true
+    });
+  }
+  next();
+});
+
 // ==========================================
-// 🛡️ ULTIMATE SECURITY PATCH (ACTIVE)
+// 🛡️ SECURITY PATCH (ACTIVE)
 // ==========================================
 
-// 1. HELMET: Fake HTTP headers set karta hai taaki hacker ko pata na chale backend kis language mein bana hai
+// 1. HELMET: HTTP headers secure karta hai
 app.use(helmet()); 
 
-// 2. RATE LIMITING: Bot attacks (DDoS) rokne ke liye. Ek IP address se 15 minute mein sirf 150 request aayengi.
+// 2. CORS: Sirf allowed frontend se requests accept karega
+const allowedOrigins = [
+  process.env.FRONTEND_URL,        // .env se aayega (local ya production)
+  'http://localhost:5173',          // Vite default port
+  'http://localhost:5174',          // Vite alternate port
+].filter(Boolean); // undefined values hata do
+
+app.use(cors({
+  origin: function (origin, callback) {
+    // Postman ya server-to-server requests allow karo (origin undefined hoga)
+    if (!origin) return callback(null, true);
+    
+    if (allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error(`CORS Error: ${origin} ko allow nahi kiya gaya!`));
+    }
+  },
+  credentials: true, // Cookies/auth headers bhejna ho toh zaroori hai
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-admin-secret'],
+}));
+
+// 3. RATE LIMITING: Bot/DDoS attacks rokne ke liye
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
   max: 150, 
@@ -28,18 +61,51 @@ const limiter = rateLimit({
 });
 app.use('/api', limiter); 
 
-// 3. PAYLOAD LIMITER: Hacker bahut badi file bhejkar server crash na kar de, isliye limit 10kb set ki hai (JSON ke liye)
+// 4. PAYLOAD LIMITER: Badi files se server crash na ho
 app.use(express.json({ limit: '10kb' })); 
 
-// 4. NoSQL INJECTION PROTECTION: Agar koi login form mein hacker code ($gt, $eq) daalega, toh ye usko delete kar dega
-//app.use(mongoSanitize());
+// 5. NoSQL INJECTION PROTECTION: MongoDB injection attacks rokta hai
+app.use(mongoSanitize());
 
-// 5. XSS PROTECTION: Agar koi room description mein virus wala javascript (<script>) daalega, toh ye usko text mein badal dega
-//app.use(xss());
+// 6. XSS PROTECTION: Express 5 safe recursive sanitization (fixes getter-only req.query issues)
+const cleanXss = (val) => {
+  if (typeof val === 'string') {
+    return val.replace(/<script[^>]*>([\s\S]*?)<\/script>/gi, '')
+              .replace(/<[^>]*>/g, '');
+  }
+  if (Array.isArray(val)) {
+    return val.map(cleanXss);
+  }
+  if (val && typeof val === 'object') {
+    const cleanObj = {};
+    for (const key in val) {
+      if (Object.prototype.hasOwnProperty.call(val, key)) {
+        cleanObj[key] = cleanXss(val[key]);
+      }
+    }
+    return cleanObj;
+  }
+  return val;
+};
+
+const xssClean = (req, res, next) => {
+  if (req.body) req.body = cleanXss(req.body);
+  if (req.params) req.params = cleanXss(req.params);
+  if (req.query) {
+    const cleanedQuery = cleanXss(req.query);
+    Object.defineProperty(req, 'query', {
+      value: cleanedQuery,
+      writable: true,
+      configurable: true
+    });
+  }
+  next();
+};
+
+app.use(xssClean);
 
 // ==========================================
 
-app.use(cors()); 
 app.use(morgan('dev')); 
 app.use('/uploads', express.static('uploads')); 
 
@@ -65,11 +131,21 @@ app.get('/', (req, res) => {
   });
 });
 
+// --- GLOBAL ERROR HANDLER ---
+app.use((err, req, res, next) => {
+  if (err.message && err.message.startsWith('CORS Error')) {
+    return res.status(403).json({ success: false, message: err.message });
+  }
+  console.error('❌ Server Error:', err.message);
+  res.status(500).json({ success: false, message: 'Server mein kuch gadbad hai!' });
+});
+
 // --- SERVER START ---
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
   console.log(`=================================`);
   console.log(`🚀 Server running on PORT: ${PORT}`);
-  console.log(`🛡️  Ultimate Security Patch: ACTIVE`);
+  console.log(`🛡️  Security: ACTIVE`);
+  console.log(`🌐 Allowed Origins: ${allowedOrigins.join(', ')}`);
   console.log(`=================================`);
 });

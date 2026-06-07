@@ -1,10 +1,14 @@
 module.exports = (req, res, next) => {
-  // Admin Panel se aane wala header check karenge
   const adminSecret = req.header('x-admin-secret');
 
-  // Aap yahan koi bhi secret key set kar sakte hain, abhi ke liye "my-secret-key" rakhte hain
-  if (adminSecret === 'my-secret-key') {
-    next(); // Sab sahi hai, aage badho
+  // Secret key ab .env file se aayegi, hardcode nahi hogi
+  if (!process.env.ADMIN_SECRET_KEY) {
+    console.error('❌ ADMIN_SECRET_KEY .env mein set nahi hai!');
+    return res.status(500).json({ success: false, message: 'Server configuration error.' });
+  }
+
+  if (adminSecret === process.env.ADMIN_SECRET_KEY) {
+    next();
   } else {
     res.status(403).json({ success: false, message: 'Access Denied! Tum admin nahi ho.' });
   }

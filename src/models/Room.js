@@ -24,6 +24,7 @@ const roomSchema = new mongoose.Schema({
   // 🚨 2 NAYE FIELDS: Payment Track aur Expiry ke liye
   paymentCode: { type: String, default: 'FREE' },
   expiryDate: { type: Date, default: null },
+  unavailableReportCount: { type: Number, default: 0 },
 
   createdAt: { type: Date, default: Date.now }
 });

@@ -75,6 +75,10 @@ router.put('/:id/edit', upload.single('image'), async (req, res) => {
     room.landmark = req.body.landmark || room.landmark;
     room.mobile = req.body.mobile || room.mobile;
     room.description = req.body.description || room.description;
+
+    // Update location details if provided
+    if (req.body.lng) room.lng = Number(req.body.lng);
+    if (req.body.lat) room.lat = Number(req.body.lat);
     
     // User plan/payment nahi badal sakta
     if (req.file) room.image = req.file.path;
@@ -104,6 +108,18 @@ router.patch('/:id/approve', async (req, res) => {
     
     await room.save();
     res.status(200).json({ success: true, message: "Room Approved!", room });
+  } catch (error) { res.status(500).json({ success: false, message: error.message }); }
+});
+
+// --- REPORT UNAVAILABLE ---
+router.put('/:id/report-unavailable', async (req, res) => {
+  try {
+    const room = await Room.findByIdAndUpdate(
+      req.params.id, 
+      { $inc: { unavailableReportCount: 1 } }, 
+      { new: true }
+    );
+    res.status(200).json({ success: true, message: "Reported successfully", count: room.unavailableReportCount });
   } catch (error) { res.status(500).json({ success: false, message: error.message }); }
 });
 
