@@ -35,6 +35,7 @@ const allowedOrigins = [
   process.env.FRONTEND_URL,        // .env se aayega (local ya production)
   'http://localhost:5173',          // Vite default port
   'http://localhost:5174',          // Vite alternate port
+  'https://roomkhojoo.netlify.app', // User's Netlify Live App
 ].filter(Boolean); // undefined values hata do
 
 app.use(cors({
