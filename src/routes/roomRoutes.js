@@ -4,7 +4,7 @@ const crypto = require('crypto');
 const Room = require('../models/Room');
 const User = require('../models/User');
 const upload = require('../config/cloudinary');
-const { requireAuth, requireAdmin } = require('./auth');
+const { requireAuth, requireAdmin } = require('../middleware/auth');
 
 // Sirf malik ya admin modify kar sakta hai (C1 fix — ownership check)
 const canModify = (room, user) => user.role === 'admin' || room.userId === user.id;

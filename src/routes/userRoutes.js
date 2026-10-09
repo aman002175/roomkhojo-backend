@@ -5,7 +5,7 @@ const rateLimit = require('express-rate-limit');
 const { OAuth2Client } = require('google-auth-library');
 const User = require('../models/User');
 const Otp = require('../models/Otp');
-const { signUser, requireAuth, requireAdmin } = require('./auth');
+const { signUser, requireAuth, requireAdmin } = require('../middleware/auth');
 const { sendOtpEmail } = require('../config/mailer');
 
 // Brute-force protection (H4): login/google par 15 min me max 20,

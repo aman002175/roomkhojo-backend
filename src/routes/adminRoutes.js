@@ -5,7 +5,7 @@ const mongoose = require('mongoose');
 const rateLimit = require('express-rate-limit');
 const Admin = require('../models/Admin');
 const Settings = require('../models/Settings');
-const { signAdmin, requireAdmin } = require('./auth');
+const { signAdmin, requireAdmin } = require('../middleware/auth');
 
 // Login par brute-force protection: 15 min me max 10 attempts (H4)
 const loginLimiter = rateLimit({
