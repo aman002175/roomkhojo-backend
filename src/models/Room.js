@@ -23,6 +23,13 @@ const roomSchema = new mongoose.Schema({
   
   // 🚨 2 NAYE FIELDS: Payment Track aur Expiry ke liye
   paymentCode: { type: String, default: 'FREE' },
+  // User ne kaunsa promo plan MAANGA hai ('regular' | '7' | '15' | '30').
+  // isPromoted sirf admin approve ke baad true hota hai (C6 fix).
+  promoRequested: { type: String, default: 'regular' },
+  // User ka UPI Ref/UTR number (admin payment verify karne ke liye dekhta hai)
+  paymentRef: { type: String, default: '' },
+  // Report-spam rokne ke liye: kaunsi IPs report kar chuki hain
+  reportedIPs: { type: [String], default: [] },
   expiryDate: { type: Date, default: null },
   unavailableReportCount: { type: Number, default: 0 },
 

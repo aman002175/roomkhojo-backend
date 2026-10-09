@@ -1,79 +1,111 @@
 const express = require('express');
 const router = express.Router();
-const Admin = require('../models/Admin');
+const crypto = require('crypto');
 const mongoose = require('mongoose');
+const rateLimit = require('express-rate-limit');
+const Admin = require('../models/Admin');
+const Settings = require('../models/Settings');
+const { signAdmin, requireAdmin } = require('./auth');
 
-// Default Admin Create Karein (Guaranteed Execution Version)
-// Default Admin Create Karein (Force Reset Version)
+// Login par brute-force protection: 15 min me max 10 attempts (H4)
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  message: { success: false, message: 'Bahut zyada login attempts. 15 minute baad try karein.' }
+});
+
+// --- Default Admin Seed (SAFE VERSION — C3 fix) ---
+// Sirf tabhi banta hai jab DB me koi admin na ho.
+// deleteMany NAHI hai — restart par credentials wipe nahi honge.
+// Pehla password ADMIN_INITIAL_PASSWORD env se aata hai (ya random generate hota hai).
 const seedAdmin = async () => {
   try {
-    // 🚨 Purane sabhi aade-tirche admin accounts delete kardo
-    await Admin.deleteMany({});
-    // Ekdum fresh account banao
-    await Admin.create({ username: 'admin', password: 'password123' });
-    console.log('✅ Admin ID FORCE RESET -> Username: admin | Password: password123');
+    const count = await Admin.countDocuments();
+    if (count > 0) return; // Pehle se admin hai → kuch mat karo
+    const initialPassword = process.env.ADMIN_INITIAL_PASSWORD || crypto.randomBytes(12).toString('hex');
+    await Admin.create({
+      username: process.env.ADMIN_INITIAL_USERNAME || 'admin',
+      password: initialPassword // Model hook ise hash karke save karega
+    });
+    console.log('✅ Default admin account banaya gaya (username: admin).');
+    if (!process.env.ADMIN_INITIAL_PASSWORD) {
+      console.log(`🔑 Generated admin password (login karke turant badal lena): ${initialPassword}`);
+    }
   } catch (error) {
-    console.log('⚠️ Admin Check Failed:', error.message);
+    console.log('⚠️ Admin Seed Failed:', error.message);
   }
 };
 
-// 🚨 SMART CHECK: Agar MongoDB pehle hi connect ho chuka hai, toh turant chalao
 if (mongoose.connection.readyState === 1) {
   seedAdmin();
 } else {
-  // Warna connect hone ka wait karo
   mongoose.connection.once('open', seedAdmin);
 }
 
-// --- Admin Login API ---
-router.post('/login', async (req, res) => {
-  const { username, password } = req.body;
-  const admin = await Admin.findOne({ username, password });
-  if (admin) {
-    res.json({ success: true, message: 'Login successful' });
-  } else {
-    res.status(401).json({ success: false, message: 'Username ya Password galat hai!' });
+// --- Admin Login API (bcrypt + JWT — C4/C5 fix) ---
+router.post('/login', loginLimiter, async (req, res) => {
+  try {
+    const { username, password } = req.body || {};
+    if (!username || !password) {
+      return res.status(400).json({ success: false, message: 'Username aur password dono zaroori hain.' });
+    }
+    const admin = await Admin.findOne({ username });
+    if (!admin || !(await admin.comparePassword(password))) {
+      return res.status(401).json({ success: false, message: 'Username ya Password galat hai!' });
+    }
+    const token = signAdmin(admin);
+    res.json({ success: true, message: 'Login successful', token });
+  } catch (error) {
+    console.error('Admin login error:', error.message);
+    res.status(500).json({ success: false, message: 'Server me gadbad hai. Baad me try karein.' });
   }
 });
 
-// --- Admin Credentials Change API ---
-router.post('/change-credentials', async (req, res) => {
-  const { oldPassword, newUsername, newPassword } = req.body;
-  const admin = await Admin.findOne({ password: oldPassword });
-
-  if (!admin) {
-    return res.status(401).json({ success: false, message: 'Purana password galat hai!' });
+// --- Admin Credentials Change API (JWT protected — C5 fix) ---
+// Puraana password bcrypt se verify hota hai, sirf logged-in admin badal sakta hai.
+router.post('/change-credentials', requireAdmin, async (req, res) => {
+  try {
+    const { oldPassword, newUsername, newPassword } = req.body || {};
+    const admin = await Admin.findById(req.user.id);
+    if (!admin || !(await admin.comparePassword(oldPassword))) {
+      return res.status(401).json({ success: false, message: 'Purana password galat hai!' });
+    }
+    if (newUsername) admin.username = newUsername;
+    if (newPassword) admin.password = newPassword; // Model hook hash karega
+    await admin.save();
+    res.json({ success: true, message: 'Credentials successfully updated!' });
+  } catch (error) {
+    console.error('Change-credentials error:', error.message);
+    res.status(500).json({ success: false, message: 'Server me gadbad hai. Baad me try karein.' });
   }
-
-  if (newUsername) admin.username = newUsername;
-  if (newPassword) admin.password = newPassword;
-
-  await admin.save();
-  res.json({ success: true, message: 'Credentials successfully updated!' });
 });
-const Settings = require('../models/Settings');
 
 // Default Settings Create Karein (Agar pehle se nahi hai)
 const seedSettings = async () => {
   try {
     const count = await Settings.countDocuments();
     if (count === 0) await Settings.create({});
-  } catch (err) { }
+  } catch (err) { /* pehli baar DB na mile toh agli baar try hoga */ }
 };
 if (mongoose.connection.readyState === 1) seedSettings();
 else mongoose.connection.once('open', seedSettings);
 
-// --- Get App Settings API ---
+// --- Get App Settings API (public — categories/facilities sabko chahiye) ---
 router.get('/settings', async (req, res) => {
-  const settings = await Settings.findOne({ key: 'app_settings' });
-  res.json({ success: true, settings });
+  try {
+    const settings = await Settings.findOne({ key: 'app_settings' });
+    res.json({ success: true, settings });
+  } catch (error) {
+    console.error('Get settings error:', error.message);
+    res.status(500).json({ success: false, message: 'Server me gadbad hai. Baad me try karein.' });
+  }
 });
 
-// --- Update App Settings API ---
-// --- Update App Settings API ---
-router.post('/settings', async (req, res) => {
+// --- Update App Settings API (ADMIN ONLY — C2 fix) ---
+// Pehle ye khula tha: koi bhi pricing/UPI ID badal sakta tha.
+router.post('/settings', requireAdmin, async (req, res) => {
   try {
-    const { categories, facilities, pricing } = req.body;
+    const { categories, facilities, pricing } = req.body || {};
 
     const settings = await Settings.findOneAndUpdate(
       { key: 'app_settings' },
@@ -82,11 +114,9 @@ router.post('/settings', async (req, res) => {
     );
 
     res.json({ success: true, message: 'Settings securely updated!', settings });
-
   } catch (error) {
-    // Ye line error ko dhar-dabocha kar Render par print karegi!
-    console.error("🔥 BHOOT PAKDA GAYA (SETTINGS ERROR):", error);
-    res.status(500).json({ success: false, message: error.message });
+    console.error('🔥 SETTINGS ERROR:', error.message);
+    res.status(500).json({ success: false, message: 'Server me gadbad hai. Baad me try karein.' });
   }
 });
 

@@ -10,6 +10,10 @@ const connectDB = require('./config/db');
 
 const app = express();
 
+// Vercel/Render proxy ke peeche sahi client-IP ke liye (M13 fix).
+// Iske bina rate-limit galat IP par lagta hai.
+app.set('trust proxy', 1);
+
 // 🚨 EXPRESS 5 QUERY PATCH: Shadows the read-only req.query prototype getter with a writable instance property
 // so that legacy middleware (like express-mongo-sanitize) can mutate it safely.
 app.use((req, res, next) => {
@@ -51,7 +55,7 @@ app.use(cors({
   },
   credentials: true, // Cookies/auth headers bhejna ho toh zaroori hai
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'x-admin-secret'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
 }));
 
 // 3. RATE LIMITING: Bot/DDoS attacks rokne ke liye
@@ -107,8 +111,10 @@ app.use(xssClean);
 
 // ==========================================
 
-app.use(morgan('dev')); 
-app.use('/uploads', express.static('uploads')); 
+app.use(morgan('dev'));
+
+// NOTE: '/uploads' static hata diya (B4 fix) — serverless filesystem
+// ephemeral hota hai, aur saari images waise bhi Cloudinary par hain.
 
 // --- DATABASE CONNECTION ---
 connectDB();
@@ -137,16 +143,27 @@ app.use((err, req, res, next) => {
   if (err.message && err.message.startsWith('CORS Error')) {
     return res.status(403).json({ success: false, message: err.message });
   }
+  // Multer upload errors — user-friendly 400 (500 nahi)
+  if (err.code === 'LIMIT_FILE_SIZE') {
+    return res.status(400).json({ success: false, message: 'Photo 2MB se chhoti honi chahiye.' });
+  }
+  if (err.message === 'Sirf JPG, PNG ya WebP photo allowed hai.') {
+    return res.status(400).json({ success: false, message: err.message });
+  }
   console.error('❌ Server Error:', err.message);
   res.status(500).json({ success: false, message: 'Server mein kuch gadbad hai!' });
 });
 
-// --- SERVER START ---
-const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => {
-  console.log(`=================================`);
-  console.log(`🚀 Server running on PORT: ${PORT}`);
-  console.log(`🛡️  Security: ACTIVE`);
-  console.log(`🌐 Allowed Origins: ${allowedOrigins.join(', ')}`);
-  console.log(`=================================`);
-});
+// --- SERVER START (sirf direct run par; Vercel import par listen nahi — B1 fix) ---
+if (require.main === module) {
+  const PORT = process.env.PORT || 5000;
+  app.listen(PORT, () => {
+    console.log(`=================================`);
+    console.log(`🚀 Server running on PORT: ${PORT}`);
+    console.log(`🛡️  Security: ACTIVE`);
+    console.log(`🌐 Allowed Origins: ${allowedOrigins.join(', ')}`);
+    console.log(`=================================`);
+  });
+}
+
+module.exports = app;
