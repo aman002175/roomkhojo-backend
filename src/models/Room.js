@@ -28,6 +28,9 @@ const roomSchema = new mongoose.Schema({
   promoRequested: { type: String, default: 'regular' },
   // User ka UPI Ref/UTR number (admin payment verify karne ke liye dekhta hai)
   paymentRef: { type: String, default: '' },
+  // 📍 Aas-paas ke landmarks (user-selected): [{name, cat, lat, lng, distM}]
+  // Student ko dikhta hai: "Coaching X (350m) • Bus Stand (800m)"
+  landmarks: { type: [{ name: String, cat: String, lat: Number, lng: Number, distM: Number }], default: [] },
   // 🎯 BANNER ADD-ON (paid): request + admin activation + expiry
   bannerRequested: { type: Boolean, default: false },
   bannerRef: { type: String, default: '' },

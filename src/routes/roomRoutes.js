@@ -14,6 +14,22 @@ const cleanType = (raw) => {
   return ALLOWED_TYPES.includes(t) ? t : null;
 };
 
+// 📍 Landmarks parse+validate (max 8, naam 120 chars, valid coords)
+const cleanLandmarks = (raw) => {
+  try {
+    const arr = JSON.parse(raw || '[]');
+    if (!Array.isArray(arr)) return [];
+    return arr.slice(0, 8).map((l) => ({
+      name: String((l && l.name) || '').trim().slice(0, 120),
+      cat: String((l && l.cat) || '').trim().slice(0, 30),
+      lat: Number(l && l.lat),
+      lng: Number(l && l.lng),
+      distM: Math.max(0, Math.round(Number((l && l.distM) || 0)))
+    })).filter((l) => l.name && Number.isFinite(l.lat) && Number.isFinite(l.lng)
+      && l.lat >= -90 && l.lat <= 90 && l.lng >= -180 && l.lng <= 180);
+  } catch { return []; }
+};
+
 // Sirf malik ya admin modify kar sakta hai (C1 fix — ownership check)
 const canModify = (room, user) => user.role === 'admin' || room.userId === user.id;
 
@@ -49,7 +65,7 @@ router.get('/admin/all', requireAdmin, async (req, res) => {
 // paymentCode server generate karta hai (client ka random code nahi).
 router.post('/', requireAuth, upload.single('image'), async (req, res) => {
   try {
-    const { title, price, type, category, landmark, mobile, description, lng, lat, promoPlan, paymentRef, bannerRequested, bannerRef } = req.body || {};
+    const { title, price, type, category, landmark, mobile, description, lng, lat, promoPlan, paymentRef, bannerRequested, bannerRef, landmarks } = req.body || {};
 
     if (!title || !price || !type || !category) {
       return res.status(400).json({ success: false, message: 'Title, Price, Type aur Category zaroori hain.' });
@@ -102,6 +118,8 @@ router.post('/', requireAuth, upload.single('image'), async (req, res) => {
       bannerRequested: bannerRequested === 'true' || bannerRequested === true,
       bannerRef: String(bannerRef || paymentRef || '').trim().slice(0, 64),
       isBannerActive: false,
+      // 📍 User-selected nearby landmarks
+      landmarks: cleanLandmarks(landmarks),
       userId: req.user.id,
       ownerName,
       image: imageUrl,
@@ -222,6 +240,8 @@ router.put('/:id/edit', requireAuth, upload.single('image'), async (req, res) =>
       room.mobile = cleanPhone;
     }
     if (req.body.description !== undefined) room.description = String(req.body.description).trim();
+    // 📍 Landmarks dobara select kiye hon toh replace (bheje hi nahi toh puraane safe)
+    if (req.body.landmarks !== undefined) room.landmarks = cleanLandmarks(req.body.landmarks);
 
     if (req.body.lng !== undefined) {
       const cleanLng = toCoord(req.body.lng, -180, 180);
