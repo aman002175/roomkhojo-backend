@@ -5,6 +5,8 @@ const mongoose = require('mongoose');
 const rateLimit = require('express-rate-limit');
 const Admin = require('../models/Admin');
 const Settings = require('../models/Settings');
+const User = require('../models/User');
+const Room = require('../models/Room');
 const { signAdmin, requireAdmin } = require('../middleware/auth');
 
 // Login par brute-force protection: 15 min me max 10 attempts (H4)
@@ -119,6 +121,36 @@ router.post('/settings', requireAdmin, async (req, res) => {
     res.json({ success: true, message: 'Settings securely updated!', settings });
   } catch (error) {
     console.error('🔥 SETTINGS ERROR:', error.message);
+    res.status(500).json({ success: false, message: 'Server me gadbad hai. Baad me try karein.' });
+  }
+});
+
+// --- Purane ads migrate (ONE-TIME FIX) ---
+// Puraani login IDs (Google-sub numbers, 'unknown') wale rooms ko
+// email se mile user ki Mongo-ID par shift karta hai.
+// Valid Mongo-ID wale rooms ko haath NAHI lagata (safe).
+router.post('/migrate-rooms', requireAdmin, async (req, res) => {
+  try {
+    const { email } = req.body || {};
+    if (!email) {
+      return res.status(400).json({ success: false, message: 'Email zaroori hai.' });
+    }
+    const user = await User.findOne({ email: String(email).toLowerCase().trim() });
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'Is email ka user nahi mila. Pehle us email se app me login karo.' });
+    }
+    const allIds = await Room.distinct('userId');
+    const orphanIds = allIds.filter((id) => !mongoose.Types.ObjectId.isValid(id));
+    if (orphanIds.length === 0) {
+      return res.json({ success: true, migrated: 0, message: 'Koi puraana (bina-link) ad nahi mila. Sab linked hain.' });
+    }
+    const result = await Room.updateMany(
+      { userId: { $in: orphanIds } },
+      { $set: { userId: user._id.toString() } }
+    );
+    res.json({ success: true, migrated: result.modifiedCount, message: `${result.modifiedCount} puraane ads ${user.email} se link ho gaye! Dashboard refresh karo.` });
+  } catch (error) {
+    console.error('Migrate error:', error.message);
     res.status(500).json({ success: false, message: 'Server me gadbad hai. Baad me try karein.' });
   }
 });
