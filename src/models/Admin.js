@@ -13,8 +13,17 @@ adminSchema.pre('save', async function () {
   this.password = await bcrypt.hash(this.password, salt);
 });
 
-adminSchema.methods.comparePassword = function (plainPassword) {
-  return bcrypt.compare(plainPassword || '', this.password);
+// Legacy migration: puraane plaintext passwords (Render-era) pehli
+// successful login par auto-hash ho jaate hain. Uske baad bcrypt hi chalega.
+adminSchema.methods.comparePassword = async function (plainPassword) {
+  const input = plainPassword || '';
+  if (await bcrypt.compare(input, this.password)) return true;
+  if (this.password && input && this.password === input) {
+    this.password = input; // pre-save hook ise hash karke save karega
+    await this.save();
+    return true;
+  }
+  return false;
 };
 
 module.exports = mongoose.model('Admin', adminSchema);

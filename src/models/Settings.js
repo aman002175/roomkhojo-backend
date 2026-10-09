@@ -12,7 +12,9 @@ const settingSchema = new mongoose.Schema({
     promo15: { type: String, default: '499' },
     promo30: { type: String, default: '899' },
     upiId: { type: String, default: '9145891108@ikwik' } 
-  }
+  },
+  // Admin panel ka secret path — frontend App.jsx backend se fetch karta hai
+  adminPath: { type: String, default: '/admin-secret-29' }
 });
 
 module.exports = mongoose.model('Setting', settingSchema);

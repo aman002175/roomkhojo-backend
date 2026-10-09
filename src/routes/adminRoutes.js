@@ -108,13 +108,36 @@ router.get('/settings', async (req, res) => {
 
 // --- Update App Settings API (ADMIN ONLY — C2 fix) ---
 // Pehle ye khula tha: koi bhi pricing/UPI ID badal sakta tha.
+// Sirf bheje gaye fields update hote hain (partial update safe).
+const RESERVED_PATHS = ['/', '/dashboard', '/about', '/terms', '/refund'];
+const cleanAdminPath = (raw) => {
+  let p = String(raw || '').trim();
+  if (p && !p.startsWith('/')) p = `/${p}`;
+  if (p.length < 2 || p.length > 64) return null;
+  if (!/^\/[A-Za-z0-9-_]+$/.test(p)) return null;
+  if (RESERVED_PATHS.includes(p.toLowerCase())) return null;
+  return p;
+};
+
 router.post('/settings', requireAdmin, async (req, res) => {
   try {
-    const { categories, facilities, pricing } = req.body || {};
+    const { categories, facilities, pricing, adminPath } = req.body || {};
+
+    const update = {};
+    if (categories !== undefined) update.categories = categories;
+    if (facilities !== undefined) update.facilities = facilities;
+    if (pricing !== undefined) update.pricing = pricing;
+    if (adminPath !== undefined) {
+      const clean = cleanAdminPath(adminPath);
+      if (!clean) {
+        return res.status(400).json({ success: false, message: 'Admin path galat hai. Sirf a-z, 0-9, -, _ (2-64 chars, / se shuru).' });
+      }
+      update.adminPath = clean;
+    }
 
     const settings = await Settings.findOneAndUpdate(
       { key: 'app_settings' },
-      { categories, facilities, pricing },
+      update,
       { new: true, upsert: true }
     );
 
