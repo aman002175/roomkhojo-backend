@@ -15,13 +15,16 @@ const loginLimiter = rateLimit({
 });
 
 // --- Default Admin Seed (SAFE VERSION — C3 fix) ---
-// Sirf tabhi banta hai jab DB me koi admin na ho.
-// deleteMany NAHI hai — restart par credentials wipe nahi honge.
-// Pehla password ADMIN_INITIAL_PASSWORD env se aata hai (ya random generate hota hai).
+// Normal: sirf tabhi banta hai jab DB me koi admin na ho.
+// Recovery: ADMIN_FORCE_RESET=true ho toh har start par env values se
+// dobara banata hai (password bhoolne par: Vercel me naya password + ye
+// flag set karo, redeploy karo, login karo, phir flag hata do).
 const seedAdmin = async () => {
   try {
+    const forceReset = process.env.ADMIN_FORCE_RESET === 'true';
     const count = await Admin.countDocuments();
-    if (count > 0) return; // Pehle se admin hai → kuch mat karo
+    if (count > 0 && !forceReset) return; // Pehle se admin hai → kuch mat karo
+    if (forceReset) await Admin.deleteMany({});
     const initialPassword = process.env.ADMIN_INITIAL_PASSWORD || crypto.randomBytes(12).toString('hex');
     await Admin.create({
       username: process.env.ADMIN_INITIAL_USERNAME || 'admin',

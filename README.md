@@ -48,3 +48,4 @@ Auth header: `Authorization: Bearer <token>`
 - Entry: `api/index.js` + `vercel.json` rewrites (serverless).
 - Vercel dashboard me saare env vars set karo (`.env.example` list).
 - Pehla admin DB khaali hone par `ADMIN_INITIAL_*` se banta hai — login karke turant password badal lena.
+- Password bhool jao toh: `ADMIN_FORCE_RESET=true` + naya `ADMIN_INITIAL_PASSWORD` → redeploy → login → flag hatao → redeploy.
