@@ -5,6 +5,8 @@ const rateLimit = require('express-rate-limit');
 const { OAuth2Client } = require('google-auth-library');
 const User = require('../models/User');
 const Otp = require('../models/Otp');
+const Room = require('../models/Room');
+const mongoose = require('mongoose');
 const { signUser, requireAuth, requireAdmin } = require('../middleware/auth');
 const { sendOtpEmail } = require('../config/mailer');
 
@@ -251,6 +253,34 @@ router.post('/change-password', requireAuth, async (req, res) => {
     res.json({ success: true, message: 'Password update ho gaya hai.' });
   } catch (error) {
     console.error('Change-password error:', error.message);
+    res.status(500).json({ success: false, message: 'Server me gadbad hai. Baad me try karein.' });
+  }
+});
+
+// 8. Apne puraane ads khud link karo — NO ADMIN NEEDED (self-claim)
+// Puraane system ke orphan ads (bina Mongo-ID wale) ko apne account se jodta hai.
+// Guard: sirf tab jab user ke ZERO ads hon (galat claim rokne ke liye).
+router.post('/claim-orphans', authLimiter, requireAuth, async (req, res) => {
+  try {
+    if (req.user.role === 'admin') {
+      return res.status(400).json({ success: false, message: 'Admin ko iski zaroorat nahi — migrate-rooms use karo.' });
+    }
+    const mine = await Room.countDocuments({ userId: req.user.id });
+    if (mine > 0) {
+      return res.status(400).json({ success: false, message: 'Tumhare ads already linked hain.' });
+    }
+    const allIds = await Room.distinct('userId');
+    const orphans = allIds.filter((id) => !mongoose.Types.ObjectId.isValid(id));
+    if (orphans.length === 0) {
+      return res.json({ success: true, migrated: 0, message: 'Koi puraana (bina-link) ad nahi mila.' });
+    }
+    const result = await Room.updateMany(
+      { userId: { $in: orphans } },
+      { $set: { userId: req.user.id } }
+    );
+    res.json({ success: true, migrated: result.modifiedCount, message: `${result.modifiedCount} puraane ads link ho gaye!` });
+  } catch (error) {
+    console.error('Claim-orphans error:', error.message);
     res.status(500).json({ success: false, message: 'Server me gadbad hai. Baad me try karein.' });
   }
 });

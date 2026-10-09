@@ -3,8 +3,16 @@ const router = express.Router();
 const crypto = require('crypto');
 const Room = require('../models/Room');
 const User = require('../models/User');
+const Settings = require('../models/Settings');
 const upload = require('../config/cloudinary');
 const { requireAuth, requireAdmin } = require('../middleware/auth');
+
+// Audience types (category-wise frontend options ka union — backend guard)
+const ALLOWED_TYPES = ['Boys', 'Girls', 'Family', 'Anyone'];
+const cleanType = (raw) => {
+  const t = String(raw || '').trim();
+  return ALLOWED_TYPES.includes(t) ? t : null;
+};
 
 // Sirf malik ya admin modify kar sakta hai (C1 fix — ownership check)
 const canModify = (room, user) => user.role === 'admin' || room.userId === user.id;
@@ -41,10 +49,14 @@ router.get('/admin/all', requireAdmin, async (req, res) => {
 // paymentCode server generate karta hai (client ka random code nahi).
 router.post('/', requireAuth, upload.single('image'), async (req, res) => {
   try {
-    const { title, price, type, category, landmark, mobile, description, lng, lat, promoPlan, paymentRef } = req.body || {};
+    const { title, price, type, category, landmark, mobile, description, lng, lat, promoPlan, paymentRef, bannerRequested, bannerRef } = req.body || {};
 
     if (!title || !price || !type || !category) {
       return res.status(400).json({ success: false, message: 'Title, Price, Type aur Category zaroori hain.' });
+    }
+    const cleanAudience = cleanType(type);
+    if (!cleanAudience) {
+      return res.status(400).json({ success: false, message: 'Audience (Boys/Girls/Family/Anyone) sahi chuno.' });
     }
     const cleanPhone = cleanMobile(mobile);
     if (!cleanPhone) {
@@ -75,7 +87,7 @@ router.post('/', requireAuth, upload.single('image'), async (req, res) => {
     const newRoom = new Room({
       title: String(title).trim(),
       price: String(price).trim(),
-      type: String(type).trim(),
+      type: cleanAudience,
       category: String(category).trim(),
       landmark: String(landmark || '').trim(),
       mobile: cleanPhone,
@@ -86,14 +98,29 @@ router.post('/', requireAuth, upload.single('image'), async (req, res) => {
       promoPlan: 'regular',
       promoRequested: requestedPlan,
       paymentRef: String(paymentRef || '').trim().slice(0, 64),
+      // 🎯 Banner add-on request (activate sirf admin karega)
+      bannerRequested: bannerRequested === 'true' || bannerRequested === true,
+      bannerRef: String(bannerRef || paymentRef || '').trim().slice(0, 64),
+      isBannerActive: false,
       userId: req.user.id,
       ownerName,
       image: imageUrl,
       paymentCode: 'RK-' + crypto.randomBytes(3).toString('hex').toUpperCase()
     });
 
+    // 🟢 Auto-approve: sirf FREE/regular ads, aur sirf jab admin ne toggle ON kiya ho.
+    // Promo/banner wale HAMESHA pending (payment verify hoga).
+    const wantsPaid = requestedPlan !== 'regular' || newRoom.bannerRequested;
+    if (!wantsPaid) {
+      const appSettings = await Settings.findOne({ key: 'app_settings' });
+      if (appSettings && appSettings.autoApproveFree) newRoom.isApproved = true;
+    }
+
     const savedRoom = await newRoom.save();
-    res.status(201).json({ success: true, message: 'Ad submitted! Admin verification ke baad live hoga.', room: savedRoom });
+    const liveMsg = savedRoom.isApproved
+      ? 'Ad live ho gaya! 🎉'
+      : 'Ad submitted! Admin verification ke baad live hoga.';
+    res.status(201).json({ success: true, message: liveMsg, room: savedRoom });
   } catch (error) { serverError(res, error, 'Post-ad error'); }
 });
 
@@ -108,6 +135,41 @@ router.get('/', async (req, res) => {
     });
     res.status(200).json({ success: true, count: rooms.length, rooms });
   } catch (error) { serverError(res, error, 'Live-rooms error'); }
+});
+
+// --- LIVE BANNER ADS (top strip — public) ---
+router.get('/banners', async (req, res) => {
+  try {
+    const now = new Date();
+    const rooms = await Room.find({
+      isApproved: true,
+      isActive: true,
+      isBannerActive: true,
+      $or: [{ bannerExpires: null }, { bannerExpires: { $gte: now } }]
+    }).sort({ createdAt: -1 });
+    res.json({ success: true, count: rooms.length, rooms });
+  } catch (error) { serverError(res, error, 'Banners error'); }
+});
+
+// --- ADMIN: banner approve/revoke (payment verify ke baad) ---
+router.patch('/:id/banner', requireAdmin, async (req, res) => {
+  try {
+    const room = await Room.findById(req.params.id);
+    if (!room) return res.status(404).json({ success: false, message: 'Room nahi mila.' });
+    const { approve } = req.body || {};
+    if (approve) {
+      const s = await Settings.findOne({ key: 'app_settings' });
+      const days = parseInt(s && s.pricing && s.pricing.bannerDays, 10);
+      const validDays = Number.isFinite(days) && days > 0 ? days : 7;
+      room.isBannerActive = true;
+      room.bannerExpires = new Date(Date.now() + validDays * 24 * 60 * 60 * 1000);
+    } else {
+      room.isBannerActive = false;
+      room.bannerExpires = null;
+    }
+    await room.save();
+    res.json({ success: true, message: approve ? 'Banner live ho gaya! 🎯' : 'Banner hata diya gaya.', room });
+  } catch (error) { serverError(res, error, 'Banner error'); }
 });
 
 // User Dashboard Ads (SELF OR ADMIN — H1 fix, pehle koi bhi kisi ka dekh sakta tha)
@@ -147,7 +209,11 @@ router.put('/:id/edit', requireAuth, upload.single('image'), async (req, res) =>
 
     if (req.body.title) room.title = String(req.body.title).trim();
     if (req.body.price) room.price = String(req.body.price).trim();
-    if (req.body.type) room.type = String(req.body.type).trim();
+    if (req.body.type) {
+      const cleanAudience = cleanType(req.body.type);
+      if (!cleanAudience) return res.status(400).json({ success: false, message: 'Audience (Boys/Girls/Family/Anyone) sahi chuno.' });
+      room.type = cleanAudience;
+    }
     if (req.body.category) room.category = String(req.body.category).trim();
     if (req.body.landmark !== undefined) room.landmark = String(req.body.landmark).trim();
     if (req.body.mobile) {

@@ -121,12 +121,13 @@ const cleanAdminPath = (raw) => {
 
 router.post('/settings', requireAdmin, async (req, res) => {
   try {
-    const { categories, facilities, pricing, adminPath } = req.body || {};
+    const { categories, facilities, pricing, adminPath, autoApproveFree } = req.body || {};
 
     const update = {};
     if (categories !== undefined) update.categories = categories;
     if (facilities !== undefined) update.facilities = facilities;
     if (pricing !== undefined) update.pricing = pricing;
+    if (autoApproveFree !== undefined) update.autoApproveFree = autoApproveFree === true || autoApproveFree === 'true';
     if (adminPath !== undefined) {
       const clean = cleanAdminPath(adminPath);
       if (!clean) {

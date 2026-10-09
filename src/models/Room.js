@@ -28,6 +28,11 @@ const roomSchema = new mongoose.Schema({
   promoRequested: { type: String, default: 'regular' },
   // User ka UPI Ref/UTR number (admin payment verify karne ke liye dekhta hai)
   paymentRef: { type: String, default: '' },
+  // 🎯 BANNER ADD-ON (paid): request + admin activation + expiry
+  bannerRequested: { type: Boolean, default: false },
+  bannerRef: { type: String, default: '' },
+  isBannerActive: { type: Boolean, default: false },
+  bannerExpires: { type: Date, default: null },
   // Report-spam rokne ke liye: kaunsi IPs report kar chuki hain
   reportedIPs: { type: [String], default: [] },
   expiryDate: { type: Date, default: null },

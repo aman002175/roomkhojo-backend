@@ -11,8 +11,14 @@ const settingSchema = new mongoose.Schema({
     promo7: { type: String, default: '299' },
     promo15: { type: String, default: '499' },
     promo30: { type: String, default: '899' },
-    upiId: { type: String, default: '9145891108@ikwik' } 
+    upiId: { type: String, default: '9145891108@ikwik' },
+    // 🎯 Banner add-on: kitna charge + kitne din (admin editable)
+    bannerPrice: { type: String, default: '499' },
+    bannerDays: { type: String, default: '7' }
   },
+  // 🟢 Free/regular ads bina admin-approval ke live? (admin toggle)
+  // Promo/paid ads HAMESHA approval mangte hain (payment verify).
+  autoApproveFree: { type: Boolean, default: false },
   // Admin panel ka secret path — frontend App.jsx backend se fetch karta hai
   adminPath: { type: String, default: '/admin-secret-29' }
 });
