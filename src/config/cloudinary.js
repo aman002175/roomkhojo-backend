@@ -12,8 +12,8 @@ cloudinary.config({
 // (multer-storage-cloudinary hata diya: wo cloudinary-v1 par atka tha — H2 fix)
 const upload = multer({
   storage: multer.memoryStorage(),
-  // H3 fix: unlimited upload DoS rokne ke liye — max 2MB, sirf 1 file
-  limits: { fileSize: 2 * 1024 * 1024, files: 1 },
+  // H3 fix: unlimited upload DoS rokne ke liye — har file max 2MB, max 6 files
+  limits: { fileSize: 2 * 1024 * 1024, files: 6 },
   fileFilter: (req, file, cb) => {
     if (/^image\/(jpe?g|png|webp)$/.test(file.mimetype)) return cb(null, true);
     cb(new Error('Sirf JPG, PNG ya WebP photo allowed hai.'));

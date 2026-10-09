@@ -8,7 +8,9 @@ const roomSchema = new mongoose.Schema({
   landmark: { type: String }, 
   mobile: { type: String },      
   description: { type: String }, 
-  image: { type: String },       
+  image: { type: String },
+  // 📸 Photo gallery (max 6) — image = pehli photo (puraane code ke liye)
+  images: { type: [String], default: [] },
   lng: { type: Number, required: true },
   lat: { type: Number, required: true },
   

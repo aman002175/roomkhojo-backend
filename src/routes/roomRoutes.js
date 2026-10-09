@@ -63,7 +63,7 @@ router.get('/admin/all', requireAdmin, async (req, res) => {
 // userId/ownerName token se aate hain (client-spoofing band).
 // isPromoted client se NAHI liya jaata — promo sirf admin approve ke baad lagta hai.
 // paymentCode server generate karta hai (client ka random code nahi).
-router.post('/', requireAuth, upload.single('image'), async (req, res) => {
+router.post('/', requireAuth, upload.array('images', 6), async (req, res) => {
   try {
     const { title, price, type, category, landmark, mobile, description, lng, lat, promoPlan, paymentRef, bannerRequested, bannerRef, landmarks } = req.body || {};
 
@@ -93,11 +93,13 @@ router.post('/', requireAuth, upload.single('image'), async (req, res) => {
       ownerName = 'Admin';
     }
 
-    // Photo Cloudinary par upload karo (memory buffer se)
-    let imageUrl = '';
-    if (req.file) {
-      const uploaded = await upload.uploadBufferToCloudinary(req.file);
-      imageUrl = uploaded.secure_url || '';
+    // 📸 Photos Cloudinary par upload karo (max 6, memory buffer se)
+    let imageUrls = [];
+    if (req.files && req.files.length > 0) {
+      const uploaded = await Promise.all(
+        req.files.slice(0, 6).map((f) => upload.uploadBufferToCloudinary(f))
+      );
+      imageUrls = uploaded.map((u) => u.secure_url).filter(Boolean);
     }
 
     const newRoom = new Room({
@@ -122,7 +124,8 @@ router.post('/', requireAuth, upload.single('image'), async (req, res) => {
       landmarks: cleanLandmarks(landmarks),
       userId: req.user.id,
       ownerName,
-      image: imageUrl,
+      image: imageUrls[0] || '',
+      images: imageUrls,
       paymentCode: 'RK-' + crypto.randomBytes(3).toString('hex').toUpperCase()
     });
 
@@ -217,7 +220,7 @@ router.patch('/:id/toggle-status', requireAuth, async (req, res) => {
 
 // SMART EDIT ROUTE (OWNER OR ADMIN — C1 fix; edit = dobara pending)
 // NOTE: auth check multer se PEHLE hai taaki bina-login upload na ho.
-router.put('/:id/edit', requireAuth, upload.single('image'), async (req, res) => {
+router.put('/:id/edit', requireAuth, upload.array('images', 6), async (req, res) => {
   try {
     const room = await Room.findById(req.params.id);
     if (!room) return res.status(404).json({ success: false, message: 'Room not found' });
@@ -254,11 +257,29 @@ router.put('/:id/edit', requireAuth, upload.single('image'), async (req, res) =>
       room.lat = cleanLat;
     }
 
-    // Nayi photo aayi ho toh Cloudinary par upload karke update karo
-    if (req.file) {
-      const uploaded = await upload.uploadBufferToCloudinary(req.file);
-      if (uploaded.secure_url) room.image = uploaded.secure_url;
+    // 📸 Gallery: keep-list (sirf mevcut photos me se) + naye uploads, max 6
+    const currentGallery = (room.images && room.images.length > 0)
+      ? [...room.images]
+      : (room.image ? [room.image] : []);
+    let keepList = [...currentGallery];
+    if (req.body.keepImages !== undefined) {
+      try {
+        const arr = JSON.parse(req.body.keepImages || '[]');
+        keepList = Array.isArray(arr)
+          ? arr.filter((u) => typeof u === 'string' && currentGallery.includes(u)).slice(0, 6)
+          : [];
+      } catch { keepList = []; }
     }
+    let newUrls = [];
+    if (req.files && req.files.length > 0) {
+      const uploaded = await Promise.all(
+        req.files.slice(0, 6).map((f) => upload.uploadBufferToCloudinary(f))
+      );
+      newUrls = uploaded.map((u) => u.secure_url).filter(Boolean);
+    }
+    const finalGallery = [...keepList, ...newUrls].slice(0, 6);
+    room.images = finalGallery;
+    room.image = finalGallery[0] || '';
 
     // 🚨 FRAUD PROTECTION: User ne edit kiya = Approve hategi aur Pending me jayega!
     room.isApproved = false;
