@@ -42,6 +42,8 @@ const roomSchema = new mongoose.Schema({
   reportedIPs: { type: [String], default: [] },
   expiryDate: { type: Date, default: null },
   unavailableReportCount: { type: Number, default: 0 },
+  // 👁 Ad kitni baar dekha gaya (D1 — dashboard me owner ko dikhta hai)
+  views: { type: Number, default: 0 },
 
   createdAt: { type: Date, default: Date.now }
 });

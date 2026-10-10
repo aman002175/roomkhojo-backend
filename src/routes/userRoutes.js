@@ -285,6 +285,24 @@ router.post('/claim-orphans', authLimiter, requireAuth, async (req, res) => {
   }
 });
 
+// 9. Apna naam badlo (logged-in user — settings panel se)
+router.patch('/profile', requireAuth, async (req, res) => {
+  try {
+    const clean = String((req.body || {}).name || '').trim();
+    if (clean.length < 2 || clean.length > 60) {
+      return res.status(400).json({ success: false, message: 'Naam 2-60 characters ka ho.' });
+    }
+    const user = await User.findById(req.user.id);
+    if (!user) return res.status(404).json({ success: false, message: 'Account nahi mila.' });
+    user.name = clean;
+    await user.save();
+    res.json({ success: true, message: 'Naam update ho gaya!', user: publicUser(user) });
+  } catch (error) {
+    console.error('Profile error:', error.message);
+    res.status(500).json({ success: false, message: 'Server me gadbad hai. Baad me try karein.' });
+  }
+});
+
 // GET Total Users Count — ADMIN ONLY (M14 fix, pehle public tha)
 router.get('/count', requireAdmin, async (req, res) => {
   try {

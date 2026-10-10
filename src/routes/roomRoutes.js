@@ -352,9 +352,28 @@ router.put('/:id/report-unavailable', async (req, res) => {
     }
     room.reportedIPs = [...(room.reportedIPs || []), ip].slice(-500);
     room.unavailableReportCount = (room.unavailableReportCount || 0) + 1;
+    // 🛡️ C1: 3+ reports par ad AUTO-HIDE (review ke liye) — fake ads control
+    let hidden = false;
+    if (room.unavailableReportCount >= 3 && room.isActive) {
+      room.isActive = false;
+      hidden = true;
+    }
     await room.save();
-    res.status(200).json({ success: true, message: 'Reported successfully', count: room.unavailableReportCount });
+    res.status(200).json({
+      success: true,
+      message: hidden ? 'Report noted. Ad zyada reports par auto-hide ho gaya hai.' : 'Reported successfully',
+      count: room.unavailableReportCount,
+      hidden
+    });
   } catch (error) { serverError(res, error, 'Report error'); }
+});
+
+// --- AD VIEW COUNTER (public, D1) — popup khulne par +1, fail silent (UX na toote)
+router.put('/:id/view', async (req, res) => {
+  try {
+    await Room.findByIdAndUpdate(req.params.id, { $inc: { views: 1 } });
+    res.json({ success: true });
+  } catch { res.json({ success: false }); }
 });
 
 // Delete ad (OWNER OR ADMIN — C1 fix + M15 null check)
