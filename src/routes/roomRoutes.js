@@ -298,21 +298,46 @@ router.patch('/:id/approve', requireAdmin, async (req, res) => {
     room.isApproved = true;
 
     if (room.promoRequested && room.promoRequested !== 'regular') {
+      const newPlan = room.promoRequested;
+      const planChanged = room.promoPlan !== newPlan;
       room.isPromoted = true;
-      room.promoPlan = room.promoRequested;
-    }
-
-    // 🚨 TIMER LOCK: Sirf pehli baar approve hone par hi Expiry Date set hogi.
-    if (room.isPromoted && room.promoPlan !== 'regular' && !room.expiryDate) {
-      const days = parseInt(room.promoPlan, 10);
-      if (Number.isFinite(days) && days > 0) {
-        room.expiryDate = new Date(Date.now() + days * 24 * 60 * 60 * 1000);
+      room.promoPlan = newPlan;
+      // Expiry reset: pehli baar, plan badalne par, ya renew par (puraani expiry beet chuki ho)
+      const expired = !room.expiryDate || room.expiryDate <= new Date();
+      if (planChanged || expired) {
+        const days = parseInt(newPlan, 10);
+        if (Number.isFinite(days) && days > 0) {
+          room.expiryDate = new Date(Date.now() + days * 24 * 60 * 60 * 1000);
+        }
       }
     }
 
     await room.save();
     res.status(200).json({ success: true, message: 'Room Approved!', room });
   } catch (error) { serverError(res, error, 'Approve error'); }
+});
+
+// --- RENEW PROMO PLAN (OWNER OR ADMIN) ---
+// Expired promo dobara khareedo: naya plan + UPI ref → dobara pending (admin verify karega).
+// Expiry approve ke time fresh set hogi (upar logic).
+router.post('/:id/renew', requireAuth, async (req, res) => {
+  try {
+    const room = await Room.findById(req.params.id);
+    if (!room) return res.status(404).json({ success: false, message: 'Room nahi mila.' });
+    if (!canModify(room, req.user)) {
+      return res.status(403).json({ success: false, message: 'Access Denied! Ye ad aapka nahi hai.' });
+    }
+    const { promoPlan, paymentRef } = req.body || {};
+    if (!['7', '15', '30'].includes(promoPlan)) {
+      return res.status(400).json({ success: false, message: 'Plan 7, 15 ya 30 din ka chuno.' });
+    }
+    room.promoRequested = promoPlan;
+    room.paymentRef = String(paymentRef || '').trim().slice(0, 64);
+    room.paymentCode = 'RK-' + crypto.randomBytes(3).toString('hex').toUpperCase();
+    room.isApproved = false; // Dobara admin verification (payment check)
+    await room.save();
+    res.json({ success: true, message: 'Renew request bheji gayi! Payment verify hote hi ad live hoga.', room });
+  } catch (error) { serverError(res, error, 'Renew error'); }
 });
 
 // --- REPORT UNAVAILABLE (spam-guard ke saath — M1 fix) ---
