@@ -46,7 +46,7 @@ router.post('/signup', authLimiter, async (req, res) => {
     if (existingUser) {
       return res.status(400).json({ success: false, message: 'Ye Email pehle se registered hai!' });
     }
-    const newUser = await User.create({ name, email, password }); // Model hook hash karega
+    const newUser = await User.create({ name, email, password, termsAcceptedAt: new Date() }); // Model hook hash karega
     const token = signUser(newUser);
     res.status(201).json({ success: true, message: 'Account ban gaya!', token, user: publicUser(newUser) });
   } catch (error) {
@@ -103,7 +103,8 @@ router.post('/google', authLimiter, async (req, res) => {
         name: payload.name || 'User',
         email: payload.email,
         profilePic: payload.picture || '',
-        isGoogleUser: true
+        isGoogleUser: true,
+        termsAcceptedAt: new Date()
       });
     }
 

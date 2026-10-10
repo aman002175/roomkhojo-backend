@@ -14,7 +14,9 @@ const userSchema = new mongoose.Schema({
 
   // JWT invalidation ke liye: password reset/change par bump hota hai,
   // puraane tokens apne aap bekaar ho jaate hain
-  tokenVersion: { type: Number, default: 0 }
+  tokenVersion: { type: Number, default: 0 },
+  // Terms & Refund Policy accept karne ka time (auth screen checkbox se)
+  termsAcceptedAt: { type: Date, default: null }
 }, { timestamps: true });
 
 // Password save hone se pehle hash hoga — plain password kabhi DB me nahi jayega

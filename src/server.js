@@ -128,6 +128,7 @@ const userRoutes = require('./routes/userRoutes');
 app.use('/api/rooms', roomRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/users', userRoutes);
+app.use('/api/support', require('./routes/supportRoutes'));
 
 // --- HEALTH CHECK ROUTE ---
 app.get('/', (req, res) => {
