@@ -330,7 +330,7 @@ router.post('/favorites/:roomId/toggle', requireAuth, async (req, res) => {
       return res.json({ success: true, saved: false, message: 'Saved se hataya.' });
     }
     await Favorite.create({ userId: req.user.id, roomId: room._id });
-    res.json({ success: true, saved: true, message: 'Save ho gaya! ❤️' });
+    res.json({ success: true, saved: true, message: 'Save ho gaya!' });
   } catch (error) {
     if (error.code === 11000) return res.json({ success: true, saved: true });
     console.error('Favorite toggle error:', error.message);

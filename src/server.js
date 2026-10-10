@@ -62,7 +62,7 @@ app.use(cors({
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
   max: 150, 
-  message: { success: false, message: 'Bahut zyada requests aa rahi hain. Kripya 15 minute baad try karein 🚨' }
+  message: { success: false, message: 'Bahut zyada requests aa rahi hain. Kripya 15 minute baad try karein.' }
 });
 app.use('/api', limiter); 
 
@@ -133,7 +133,7 @@ app.use('/api/users', userRoutes);
 app.get('/', (req, res) => {
   res.status(200).json({
     success: true,
-    message: 'RoomKhojo Secure API is Live! 🚀',
+    message: 'RoomKhojo Secure API is Live!',
     version: '1.0.0'
   });
 });

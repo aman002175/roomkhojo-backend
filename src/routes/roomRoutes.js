@@ -139,7 +139,7 @@ router.post('/', requireAuth, upload.array('images', 6), async (req, res) => {
 
     const savedRoom = await newRoom.save();
     const liveMsg = savedRoom.isApproved
-      ? 'Ad live ho gaya! 🎉'
+      ? 'Ad live ho gaya!'
       : 'Ad submitted! Admin verification ke baad live hoga.';
     res.status(201).json({ success: true, message: liveMsg, room: savedRoom });
   } catch (error) { serverError(res, error, 'Post-ad error'); }
@@ -189,7 +189,7 @@ router.patch('/:id/banner', requireAdmin, async (req, res) => {
       room.bannerExpires = null;
     }
     await room.save();
-    res.json({ success: true, message: approve ? 'Banner live ho gaya! 🎯' : 'Banner hata diya gaya.', room });
+    res.json({ success: true, message: approve ? 'Banner live ho gaya!' : 'Banner hata diya gaya.', room });
   } catch (error) { serverError(res, error, 'Banner error'); }
 });
 
