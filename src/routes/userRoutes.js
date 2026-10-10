@@ -6,6 +6,7 @@ const { OAuth2Client } = require('google-auth-library');
 const User = require('../models/User');
 const Otp = require('../models/Otp');
 const Room = require('../models/Room');
+const Favorite = require('../models/Favorite');
 const mongoose = require('mongoose');
 const { signUser, requireAuth, requireAdmin } = require('../middleware/auth');
 const { sendOtpEmail } = require('../config/mailer');
@@ -299,6 +300,40 @@ router.patch('/profile', requireAuth, async (req, res) => {
     res.json({ success: true, message: 'Naam update ho gaya!', user: publicUser(user) });
   } catch (error) {
     console.error('Profile error:', error.message);
+    res.status(500).json({ success: false, message: 'Server me gadbad hai. Baad me try karein.' });
+  }
+});
+
+// 10. ❤️ Saved ads list (full room data ke saath)
+router.get('/favorites', requireAuth, async (req, res) => {
+  try {
+    const favs = await Favorite.find({ userId: req.user.id }).sort({ createdAt: -1 });
+    const rooms = await Room.find({ _id: { $in: favs.map((f) => f.roomId) } });
+    const order = {};
+    favs.forEach((f, i) => { order[f.roomId.toString()] = i; });
+    rooms.sort((a, b) => (order[a._id.toString()] || 0) - (order[b._id.toString()] || 0));
+    res.json({ success: true, rooms });
+  } catch (error) {
+    console.error('Favorites error:', error.message);
+    res.status(500).json({ success: false, message: 'Server me gadbad hai. Baad me try karein.' });
+  }
+});
+
+// 11. ❤️ Save/Unsave toggle
+router.post('/favorites/:roomId/toggle', requireAuth, async (req, res) => {
+  try {
+    const room = await Room.findById(req.params.roomId);
+    if (!room) return res.status(404).json({ success: false, message: 'Room nahi mila.' });
+    const existing = await Favorite.findOne({ userId: req.user.id, roomId: room._id });
+    if (existing) {
+      await Favorite.deleteOne({ _id: existing._id });
+      return res.json({ success: true, saved: false, message: 'Saved se hataya.' });
+    }
+    await Favorite.create({ userId: req.user.id, roomId: room._id });
+    res.json({ success: true, saved: true, message: 'Save ho gaya! ❤️' });
+  } catch (error) {
+    if (error.code === 11000) return res.json({ success: true, saved: true });
+    console.error('Favorite toggle error:', error.message);
     res.status(500).json({ success: false, message: 'Server me gadbad hai. Baad me try karein.' });
   }
 });

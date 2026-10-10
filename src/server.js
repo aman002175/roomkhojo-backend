@@ -138,6 +138,37 @@ app.get('/', (req, res) => {
   });
 });
 
+// --- SHARE PAGE /r/:id — visiting-card link (WhatsApp preview ke liye OG tags) ---
+// Human browser → frontend deep-link par redirect. Crawler → OG card padhta hai.
+const escHtml = (s) => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;')
+  .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+
+app.get('/r/:id', async (req, res) => {
+  try {
+    const Room = require('./models/Room');
+    const room = await Room.findById(req.params.id);
+    if (!room) return res.status(404).send('Ad nahi mila.');
+    const front = (process.env.FRONTEND_URL || 'https://roomkhojoo.vercel.app').replace(/\/$/, '');
+    const deepLink = `${front}/?room=${room._id}`;
+    const title = escHtml(`${room.title} — ${room.price} | RoomKhojo`);
+    const desc = escHtml(`${room.category || ''} • ${room.type || ''} • 📍 ${room.landmark || 'Hanumangarh'} • ${room.ownerName || 'Owner'}`);
+    const img = room.image && room.image.startsWith('http') ? room.image
+      : 'https://images.unsplash.com/photo-1522708323590-d24dbb6b0267?w=800&q=80';
+    res.set('Content-Security-Policy', "default-src 'self' https:; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src *");
+    res.status(200).send(`<!doctype html><html lang="hi"><head><meta charset="utf-8">`
+      + `<title>${title}</title><meta name="description" content="${desc}">`
+      + `<meta property="og:title" content="${title}"><meta property="og:description" content="${desc}">`
+      + `<meta property="og:image" content="${img}"><meta property="og:type" content="website">`
+      + `<meta name="twitter:card" content="summary_large_image">`
+      + `<meta http-equiv="refresh" content="0;url=${deepLink}">`
+      + `</head><body><p>RoomKhojo ad khul raha hai… <a href="${deepLink}">Yahan click karo</a></p>`
+      + `<script>window.location.replace(${JSON.stringify(deepLink)});</script></body></html>`);
+  } catch (err) {
+    console.error('Share-page error:', err.message);
+    res.status(500).send('Server me gadbad hai.');
+  }
+});
+
 // --- GLOBAL ERROR HANDLER ---
 app.use((err, req, res, next) => {
   if (err.message && err.message.startsWith('CORS Error')) {
