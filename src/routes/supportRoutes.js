@@ -24,8 +24,13 @@ router.post('/', requireAuth, upload.single('images'), async (req, res) => {
     }
     let imageUrl = '';
     if (req.file) {
-      const uploaded = await upload.uploadBufferToCloudinary(req.file);
-      imageUrl = uploaded.secure_url || '';
+      try {
+        const uploaded = await upload.uploadBufferToCloudinary(req.file);
+        imageUrl = uploaded.secure_url || '';
+      } catch (uploadErr) {
+        // Photo fail ho toh bhi complaint REGISTER hogi (bina photo) — kabhi 500 nahi
+        console.error('Ticket-photo upload failed (ticket bina photo save hoga):', uploadErr.message);
+      }
     }
     const ticket = await SupportTicket.create({
       userId: req.user.id,
