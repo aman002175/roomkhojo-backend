@@ -146,14 +146,12 @@ router.post('/', requireAuth, upload.array('images', 6), async (req, res) => {
 });
 
 // --- LIVE ROOMS (MAP VIEW — public) ---
+// Promo expire hone par ad GAYAB nahi hota — NORMAL (free) ad ki tarah live rehta hai.
+// Featured/normal ka faisla frontend karta hai (expiry dekh kar), isliye yahan
+// expiry filter nahi hai. (Banner strip ka alag strict filter hai.)
 router.get('/', async (req, res) => {
   try {
-    const currentDate = new Date();
-    const rooms = await Room.find({
-      isApproved: true,
-      isActive: true,
-      $or: [{ expiryDate: null }, { expiryDate: { $gte: currentDate } }]
-    });
+    const rooms = await Room.find({ isApproved: true, isActive: true });
     res.status(200).json({ success: true, count: rooms.length, rooms });
   } catch (error) { serverError(res, error, 'Live-rooms error'); }
 });
