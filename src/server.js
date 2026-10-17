@@ -128,12 +128,14 @@ connectDB();
 const roomRoutes = require('./routes/roomRoutes');
 const adminRoutes = require('./routes/adminRoutes');
 const userRoutes = require('./routes/userRoutes');
+const cronRoutes = require('./routes/cronRoutes');
 
 // --- API ENDPOINTS ---
 app.use('/api/rooms', roomRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/support', require('./routes/supportRoutes'));
+app.use('/api/cron', cronRoutes); // ⏰ P1 #22: promo/banner expiry (Vercel Cron daily)
 
 // --- HEALTH CHECK ROUTE ---
 app.get('/', (req, res) => {

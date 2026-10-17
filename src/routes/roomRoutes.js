@@ -23,6 +23,16 @@ const cleanPayCode = (raw) => {
 };
 const newPayCode = () => 'RK-' + crypto.randomBytes(3).toString('hex').toUpperCase();
 
+// 💰 P1 #24: Price validation — sirf digits (1..99,99,999). "abc"/"3000-5000" reject.
+// DB me String hi rakha (purane docs + FE 'price.replace' ke saath compatible; schema
+// Number karne par purane docs ke hydration-cast ka risk tha — migration chahiye hoti).
+const cleanPrice = (raw) => {
+  const s = String(raw == null ? '' : raw).trim();
+  if (!/^\d{1,7}$/.test(s)) return null;
+  const n = parseInt(s, 10);
+  return n >= 1 ? String(n) : null;
+};
+
 // 📍 Landmarks parse+validate (max 8, naam 120 chars, valid coords)
 const cleanLandmarks = (raw) => {
   try {
@@ -74,7 +84,8 @@ router.param('id', (req, res, next, id) => {
 // --- ADMIN: saare rooms (ADMIN ONLY — pehle x-admin-secret header tha, ab JWT) ---
 router.get('/admin/all', requireAdmin, async (req, res) => {
   try {
-    const rooms = await Room.find().sort({ createdAt: -1 });
+    // P1 #19: unbounded dump band — cap 1000 + lean (admin list isse chhoti hai)
+    const rooms = await Room.find().sort({ createdAt: -1 }).limit(1000).lean();
     res.status(200).json({ success: true, rooms });
   } catch (error) { serverError(res, error, 'Admin-all error'); }
 });
@@ -123,6 +134,9 @@ router.post('/admin/claims/:id/reject', requireAdmin, async (req, res) => {
 // isPromoted client se NAHI liya jaata — promo sirf admin approve ke baad lagta hai.
 // paymentCode server generate karta hai (client ka random code nahi).
 router.post('/', requireAuth, upload.array('images', 6), async (req, res) => {
+  // P1 #21 tracking: save fail hone par upload hui photos orphan na rahein
+  let uploadedThisRequest = [];
+  let savedOk = false;
   try {
     const { title, price, type, category, landmark, mobile, description, lng, lat, promoPlan, paymentRef, paymentCode, bannerRequested, bannerRef, landmarks } = req.body || {};
 
@@ -136,6 +150,10 @@ router.post('/', requireAuth, upload.array('images', 6), async (req, res) => {
     const cleanPhone = cleanMobile(mobile);
     if (!cleanPhone) {
       return res.status(400).json({ success: false, message: 'Sahi 10-digit mobile number daliye.' });
+    }
+    const cleanPriceVal = cleanPrice(price); // P1 #24: "abc" jaisa junk price reject
+    if (!cleanPriceVal) {
+      return res.status(400).json({ success: false, message: 'Price sirf number hona chahiye (jaise 3000).' });
     }
     const cleanLng = toCoord(lng, -180, 180);
     const cleanLat = toCoord(lat, -90, 90);
@@ -158,12 +176,13 @@ router.post('/', requireAuth, upload.array('images', 6), async (req, res) => {
       const uploaded = await Promise.all(
         req.files.slice(0, 6).map((f) => upload.uploadBufferToCloudinary(f))
       );
-      imageUrls = uploaded.map((u) => u.secure_url).filter(Boolean);
+      uploadedThisRequest = uploaded.map((u) => u.secure_url).filter(Boolean);
+      imageUrls = uploadedThisRequest;
     }
 
     const newRoom = new Room({
       title: String(title).trim(),
-      price: String(price).trim(),
+      price: cleanPriceVal,
       type: cleanAudience,
       category: String(category).trim(),
       landmark: String(landmark || '').trim(),
@@ -197,11 +216,18 @@ router.post('/', requireAuth, upload.array('images', 6), async (req, res) => {
     }
 
     const savedRoom = await newRoom.save();
+    savedOk = true;
     const liveMsg = savedRoom.isApproved
       ? 'Ad live ho gaya!'
       : 'Ad submitted! Admin verification ke baad live hoga.';
     res.status(201).json({ success: true, message: liveMsg, room: savedRoom });
-  } catch (error) { serverError(res, error, 'Post-ad error'); }
+  } catch (error) {
+    // P1 #21: ad save fail hui toh upload hui photos Cloudinary par orphan na rahein
+    if (!savedOk && uploadedThisRequest.length > 0) {
+      await upload.destroyByUrls(uploadedThisRequest).catch(() => {});
+    }
+    serverError(res, error, 'Post-ad error');
+  }
 });
 
 // --- LIVE ROOMS (MAP VIEW — public) ---
@@ -210,8 +236,10 @@ router.post('/', requireAuth, upload.array('images', 6), async (req, res) => {
 // expiry filter nahi hai. (Banner strip ka alag strict filter hai.)
 router.get('/', async (req, res) => {
   try {
+    // P1 #19: unbounded dump band — cap 1000 + lean (map par isse zyada pins ka koi fayda nahi)
     const rooms = await Room.find({ isApproved: true, isActive: true })
-      .select('-reportedIPs -paymentRef -paymentCode -bannerRef -viewKeys');
+      .select('-reportedIPs -paymentRef -paymentCode -bannerRef -viewKeys')
+      .sort({ createdAt: -1 }).limit(1000).lean();
     res.status(200).json({ success: true, count: rooms.length, rooms });
   } catch (error) { serverError(res, error, 'Live-rooms error'); }
 });
@@ -225,7 +253,7 @@ router.get('/banners', async (req, res) => {
       isActive: true,
       isBannerActive: true,
       $or: [{ bannerExpires: null }, { bannerExpires: { $gte: now } }]
-    }).select('-reportedIPs -paymentRef -paymentCode -bannerRef -viewKeys').sort({ createdAt: -1 });
+    }).select('-reportedIPs -paymentRef -paymentCode -bannerRef -viewKeys').sort({ createdAt: -1 }).limit(50).lean(); // P1 #19 (top strip chhota hota hai)
     res.json({ success: true, count: rooms.length, rooms });
   } catch (error) { serverError(res, error, 'Banners error'); }
 });
@@ -257,7 +285,7 @@ router.get('/user/:userId', requireAuth, async (req, res) => {
     if (req.user.role !== 'admin' && req.params.userId !== req.user.id) {
       return res.status(403).json({ success: false, message: 'Access Denied!' });
     }
-    const rooms = await Room.find({ userId: req.params.userId }).sort({ createdAt: -1 });
+    const rooms = await Room.find({ userId: req.params.userId }).sort({ createdAt: -1 }).limit(500).lean(); // P1 #19
     res.json({ success: true, rooms });
   } catch (error) { serverError(res, error, 'User-rooms error'); }
 });
@@ -279,6 +307,9 @@ router.patch('/:id/toggle-status', requireAuth, async (req, res) => {
 // SMART EDIT ROUTE (OWNER OR ADMIN — C1 fix; edit = dobara pending)
 // NOTE: auth check multer se PEHLE hai taaki bina-login upload na ho.
 router.put('/:id/edit', requireAuth, upload.array('images', 6), async (req, res) => {
+  // P1 #21 tracking: edit fail hone par nayi upload hui photos orphan na rahein
+  let uploadedThisRequest = [];
+  let savedOk = false;
   try {
     const room = await Room.findById(req.params.id);
     if (!room) return res.status(404).json({ success: false, message: 'Room not found' });
@@ -287,7 +318,11 @@ router.put('/:id/edit', requireAuth, upload.array('images', 6), async (req, res)
     }
 
     if (req.body.title) room.title = String(req.body.title).trim();
-    if (req.body.price) room.price = String(req.body.price).trim();
+    if (req.body.price) {
+      const cleanPriceVal = cleanPrice(req.body.price); // P1 #24
+      if (!cleanPriceVal) return res.status(400).json({ success: false, message: 'Price sirf number hona chahiye (jaise 3000).' });
+      room.price = cleanPriceVal;
+    }
     if (req.body.type) {
       const cleanAudience = cleanType(req.body.type);
       if (!cleanAudience) return res.status(400).json({ success: false, message: 'Audience (Boys/Girls/Family/Anyone) sahi chuno.' });
@@ -333,9 +368,12 @@ router.put('/:id/edit', requireAuth, upload.array('images', 6), async (req, res)
       const uploaded = await Promise.all(
         req.files.slice(0, 6).map((f) => upload.uploadBufferToCloudinary(f))
       );
-      newUrls = uploaded.map((u) => u.secure_url).filter(Boolean);
+      uploadedThisRequest = uploaded.map((u) => u.secure_url).filter(Boolean);
+      newUrls = uploadedThisRequest;
     }
     const finalGallery = [...keepList, ...newUrls].slice(0, 6);
+    // P1 #21: jo purani photos is edit me hata di gayi, wo Cloudinary par orphan na rahein
+    const removedUrls = currentGallery.filter((u) => !finalGallery.includes(u));
     room.images = finalGallery;
     room.image = finalGallery[0] || '';
 
@@ -343,8 +381,15 @@ router.put('/:id/edit', requireAuth, upload.array('images', 6), async (req, res)
     room.isApproved = false;
 
     await room.save();
+    savedOk = true;
+    if (removedUrls.length > 0) await upload.destroyByUrls(removedUrls).catch(() => {}); // P1 #21
     res.status(200).json({ success: true, message: 'Ad updated! Sent to Admin for verification.', room });
-  } catch (error) { serverError(res, error, 'Edit-room error'); }
+  } catch (error) {
+    if (!savedOk && uploadedThisRequest.length > 0) {
+      await upload.destroyByUrls(uploadedThisRequest).catch(() => {}); // P1 #21: save hua hi nahi
+    }
+    serverError(res, error, 'Edit-room error');
+  }
 });
 
 // --- ADMIN APPROVE LOGIC (ADMIN ONLY — C1 fix) ---
@@ -510,6 +555,9 @@ router.delete('/:id', requireAuth, async (req, res) => {
       return res.status(403).json({ success: false, message: 'Access Denied! Ye ad aapka nahi hai.' });
     }
     await Room.findByIdAndDelete(req.params.id);
+    // P1 #21: ad delete par uski saari photos Cloudinary se bhi hatao (bounded, best-effort)
+    const galleryToDelete = [...(room.images || []), room.image].filter(Boolean);
+    await upload.destroyByUrls(galleryToDelete).catch(() => {});
     res.status(200).json({ success: true, message: 'Room Deleted!' });
   } catch (error) { serverError(res, error, 'Delete error'); }
 });

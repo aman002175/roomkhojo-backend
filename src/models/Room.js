@@ -54,4 +54,12 @@ const roomSchema = new mongoose.Schema({
   createdAt: { type: Date, default: Date.now }
 });
 
+// ⚡ P1 #20: Query indexes (Mongoose connect par auto-build — idempotent, Vercel par bhi).
+// NOTE: lat/lng alag Number fields hain (GeoJSON nahi) — 2dsphere index ke liye schema
+// migration chahiye; isliye filhaal geo index skip (app ke scale par map client-side hai).
+roomSchema.index({ isApproved: 1, isActive: 1, createdAt: -1 }); // public /rooms (live map)
+roomSchema.index({ userId: 1, createdAt: -1 });                  // dashboard "my rooms"
+roomSchema.index({ isPromoted: 1, expiryDate: 1 });              // promo expiry cron (#22)
+roomSchema.index({ isBannerActive: 1, bannerExpires: 1 });       // banner strip + cron
+
 module.exports = mongoose.model('Room', roomSchema);

@@ -24,6 +24,12 @@ const otpRequestLimiter = createLimiter('otp-req', {
   max: 10,
   message: { success: false, message: 'Bahut zyada OTP requests. 15 minute baad try karein.' }
 });
+
+// P1 #23: Google verify kabhi indefinite na latke — 8s timeout (hung Google → clean fail)
+const verifyGoogleToken = (client, idToken) => Promise.race([
+  client.verifyIdToken({ idToken, audience: process.env.GOOGLE_CLIENT_ID }),
+  new Promise((_, reject) => setTimeout(() => reject(new Error('GOOGLE_VERIFY_TIMEOUT')), 8000))
+]);
 // 🔐 P0 fix: verify-otp / reset-password par bhi limiter (pehle sirf per-record
 // 5-attempts tha — attacker naye records bana ke brute force kar sakta tha)
 const otpVerifyLimiter = createLimiter('otp-verify', {
@@ -96,10 +102,7 @@ router.post('/google', authLimiter, async (req, res) => {
       return res.status(500).json({ success: false, message: 'Server configuration error.' });
     }
     const client = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
-    const ticket = await client.verifyIdToken({
-      idToken,
-      audience: process.env.GOOGLE_CLIENT_ID
-    });
+    const ticket = await verifyGoogleToken(client, idToken); // P1 #23 (8s timeout)
     const payload = ticket.getPayload();
     if (!payload || !payload.email || !payload.email_verified) {
       return res.status(401).json({ success: false, message: 'Google verification fail ho gayi.' });
