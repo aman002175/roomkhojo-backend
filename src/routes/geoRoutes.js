@@ -6,6 +6,16 @@
 // ==========================================
 const express = require('express');
 const router = express.Router();
+const { createLimiter } = require('../utils/rateStore');
+
+// P2-5 fix: public proxy abuse rok — per-IP 60 req / 15 min
+// (Nominatim 1 req/s policy + kumi Overpass public instance ki raksha)
+const geoLimiter = createLimiter('geo', {
+  windowMs: 15 * 60 * 1000,
+  max: 60,
+  message: { success: false, message: 'Bahut zyada map requests. Thodi der baad try karein.' }
+});
+router.use(geoLimiter);
 
 const NOMINATIM = 'https://nominatim.openstreetmap.org';
 const OVERPASS = 'https://overpass.kumi.systems/api/interpreter';

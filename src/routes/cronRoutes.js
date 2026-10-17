@@ -11,7 +11,14 @@ const Room = require('../models/Room');
 router.get('/expire-promos', async (req, res) => {
   try {
     const secret = process.env.CRON_SECRET;
-    if (secret && req.headers.authorization !== `Bearer ${secret}`) {
+    const isProd = process.env.NODE_ENV === 'production' || Boolean(process.env.VERCEL);
+    // P2-6 fix: production me bina secret ke cron public bilkul na chale
+    if (!secret) {
+      if (isProd) {
+        console.error('⏰ CRON_SECRET set nahi hai — cron endpoint production me band hai.');
+        return res.status(503).json({ success: false, message: 'Cron secret configure nahi hai.' });
+      }
+    } else if (req.headers.authorization !== `Bearer ${secret}`) {
       return res.status(401).json({ success: false, message: 'Unauthorized' });
     }
     const now = new Date();

@@ -140,6 +140,14 @@ router.post('/', requireAuth, upload.array('images', 6), async (req, res) => {
   let uploadedThisRequest = [];
   let savedOk = false;
   try {
+    // P1-1 fix: per-user daily ad cap (10/din) — Cloudinary cost + spam abuse rok
+    if (req.user.role !== 'admin') {
+      const dayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+      const recentAds = await Room.countDocuments({ userId: req.user.id, createdAt: { $gte: dayAgo } });
+      if (recentAds >= 10) {
+        return res.status(429).json({ success: false, message: 'Ek din me max 10 ads post kar sakte ho. 24 ghante baad dobara try karo.' });
+      }
+    }
     const { title, price, type, category, landmark, mobile, description, lng, lat, promoPlan, paymentRef, paymentCode, bannerRequested, bannerRef, landmarks } = req.body || {};
 
     if (!title || !price || !type || !category) {
@@ -240,7 +248,7 @@ router.get('/', async (req, res) => {
   try {
     // P1 #19: unbounded dump band — cap 1000 + lean (map par isse zyada pins ka koi fayda nahi)
     const rooms = await Room.find({ isApproved: true, isActive: true })
-      .select('-reportedIPs -paymentRef -paymentCode -bannerRef -viewKeys')
+      .select('-reportedBy -userId -paymentRef -paymentCode -bannerRef -viewKeys') // P2-4: owner userId public nahi
       .sort({ createdAt: -1 }).limit(1000).lean();
     res.status(200).json({ success: true, count: rooms.length, rooms });
   } catch (error) { serverError(res, error, 'Live-rooms error'); }
@@ -255,7 +263,7 @@ router.get('/banners', async (req, res) => {
       isActive: true,
       isBannerActive: true,
       $or: [{ bannerExpires: null }, { bannerExpires: { $gte: now } }]
-    }).select('-reportedIPs -paymentRef -paymentCode -bannerRef -viewKeys').sort({ createdAt: -1 }).limit(50).lean(); // P1 #19 (top strip chhota hota hai)
+    }).select('-reportedBy -userId -paymentRef -paymentCode -bannerRef -viewKeys').sort({ createdAt: -1 }).limit(50).lean(); // P1 #19 (top strip chhota hota hai)
     res.json({ success: true, count: rooms.length, rooms });
   } catch (error) { serverError(res, error, 'Banners error'); }
 });
@@ -510,16 +518,18 @@ router.post('/:id/claim', requireAuth, async (req, res) => {
 });
 
 // --- REPORT UNAVAILABLE (atomic + spam-guard — M1/P0 fix) ---
-// IP hash se dedupe (raw IP store nahi — privacy) + atomic $push/$inc (race-safe).
-router.put('/:id/report-unavailable', async (req, res) => {
+// P1-2 fix: report ke liye LOGIN zaroori (1 account = 1 report — IP-rotation griefing band).
+// userId ka sha1 hash dedupe (raw id store nahi) + atomic $push/$inc (race-safe).
+// Threshold 5 alag users: itne reports par ad AUTO-HIDE ho jata hai.
+router.put('/:id/report-unavailable', requireAuth, async (req, res) => {
   try {
     if (!mongoose.isValidObjectId(req.params.id)) {
       return res.status(404).json({ success: false, message: 'Room nahi mila.' });
     }
-    const ipKey = crypto.createHash('sha1').update(String(req.ip || 'unknown')).digest('hex').slice(0, 24);
+    const reportKey = crypto.createHash('sha1').update(`u:${req.user.id}`).digest('hex').slice(0, 24);
     const updated = await Room.findOneAndUpdate(
-      { _id: req.params.id, reportedIPs: { $ne: ipKey } },
-      { $push: { reportedIPs: { $each: [ipKey], $slice: -500 } }, $inc: { unavailableReportCount: 1 } },
+      { _id: req.params.id, reportedBy: { $ne: reportKey } },
+      { $push: { reportedBy: { $each: [reportKey], $slice: -500 } }, $inc: { unavailableReportCount: 1 } },
       { new: true }
     );
     if (!updated) {
@@ -527,15 +537,15 @@ router.put('/:id/report-unavailable', async (req, res) => {
       if (!exists) return res.status(404).json({ success: false, message: 'Room nahi mila.' });
       return res.status(429).json({ success: false, message: 'Aap ye report pehle hi kar chuke hain.' });
     }
-    // 🛡️ C1: 3+ reports par ad AUTO-HIDE — race-safe (sirf tab jab abhi active ho)
+    // 🛡️ 5+ alag users ke reports par AUTO-HIDE — race-safe (sirf tab jab abhi active ho)
     let hidden = false;
-    if (updated.unavailableReportCount >= 3 && updated.isActive) {
+    if (updated.unavailableReportCount >= 5 && updated.isActive) {
       const r = await Room.updateOne({ _id: updated._id, isActive: true }, { $set: { isActive: false } });
       hidden = r.modifiedCount > 0;
     }
     res.status(200).json({
       success: true,
-      message: hidden ? 'Report noted. Ad zyada reports par auto-hide ho gaya hai.' : 'Reported successfully',
+      message: hidden ? 'Report noted. 5+ reports par ad auto-hide ho gaya hai.' : 'Reported successfully',
       count: updated.unavailableReportCount,
       hidden
     });

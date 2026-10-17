@@ -42,8 +42,9 @@ const roomSchema = new mongoose.Schema({
   bannerRef: { type: String, default: '' },
   isBannerActive: { type: Boolean, default: false },
   bannerExpires: { type: Date, default: null },
-  // Report-spam rokne ke liye: kaunsi IPs report kar chuki hain
-  reportedIPs: { type: [String], default: [] },
+  // P1-2 fix: report ke liye login zaroori — kis user (sha1 hash) ne report kiya
+  // (public API me kabhi nahi jayegi)
+  reportedBy: { type: [String], default: [], select: false },
   // 🔗 Purane (orphan) ad claim flow: mobile-match + admin approval (#13 fix)
   claimRequestedBy: { type: String, default: null },   // claimant ka Mongo user id
   claimRequestName: { type: String, default: '' },      // admin ko verify karne ke liye naam
