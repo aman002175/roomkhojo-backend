@@ -23,14 +23,16 @@ const cleanPayCode = (raw) => {
 };
 const newPayCode = () => 'RK-' + crypto.randomBytes(3).toString('hex').toUpperCase();
 
-// 💰 P1 #24: Price validation — sirf digits (1..99,99,999). "abc"/"3000-5000" reject.
-// DB me String hi rakha (purane docs + FE 'price.replace' ke saath compatible; schema
-// Number karne par purane docs ke hydration-cast ka risk tha — migration chahiye hoti).
+// 💰 P1 #24: Price validation + ₹ normalization. FE `₹3000` bhejta hai (aur puraana
+// data bhi `₹3000` format me hai) — isliye canonical `₹<digits>` hi store hota hai
+// (display sab jagah unchanged). Junk "abc"/"3000-5000" → null (400).
+// NOTE: DB me String hi (purane docs ke hydration-cast risk + FE price.replace compat).
 const cleanPrice = (raw) => {
-  const s = String(raw == null ? '' : raw).trim();
-  if (!/^\d{1,7}$/.test(s)) return null;
-  const n = parseInt(s, 10);
-  return n >= 1 ? String(n) : null;
+  const s = String(raw == null ? '' : raw).replace(/₹/g, '').replace(/,/g, '').trim();
+  if (!/^\d+(\.\d+)?$/.test(s)) return null;
+  const n = Number(s);
+  if (!Number.isFinite(n) || n < 1 || n > 9999999) return null;
+  return `₹${Math.round(n)}`;
 };
 
 // 📍 Landmarks parse+validate (max 8, naam 120 chars, valid coords)
