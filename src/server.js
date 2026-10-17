@@ -3,7 +3,7 @@ const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
 const morgan = require('morgan');
-const rateLimit = require('express-rate-limit');
+const { createLimiter } = require('./utils/rateStore'); // Upstash-ready (env na ho toh MemoryStore)
 const mongoSanitize = require('express-mongo-sanitize');
 
 const connectDB = require('./config/db'); 
@@ -59,7 +59,8 @@ app.use(cors({
 }));
 
 // 3. RATE LIMITING: Bot/DDoS attacks rokne ke liye
-const limiter = rateLimit({
+// 🚦 Upstash Redis env set hone par shared store — serverless multiple instances par bhi limit asli
+const limiter = createLimiter('global', {
   windowMs: 15 * 60 * 1000, // 15 minutes
   max: 150, 
   message: { success: false, message: 'Bahut zyada requests aa rahi hain. Kripya 15 minute baad try karein.' }

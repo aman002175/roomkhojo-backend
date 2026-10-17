@@ -40,6 +40,10 @@ const roomSchema = new mongoose.Schema({
   bannerExpires: { type: Date, default: null },
   // Report-spam rokne ke liye: kaunsi IPs report kar chuki hain
   reportedIPs: { type: [String], default: [] },
+  // 🔗 Purane (orphan) ad claim flow: mobile-match + admin approval (#13 fix)
+  claimRequestedBy: { type: String, default: null },   // claimant ka Mongo user id
+  claimRequestName: { type: String, default: '' },      // admin ko verify karne ke liye naam
+  claimRequestedAt: { type: Date, default: null },
   expiryDate: { type: Date, default: null },
   unavailableReportCount: { type: Number, default: 0 },
   // 👁 Ad kitni baar dekha gaya (D1 — dashboard me owner ko dikhta hai)

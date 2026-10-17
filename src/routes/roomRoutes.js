@@ -42,6 +42,9 @@ const cleanLandmarks = (raw) => {
 // Sirf malik ya admin modify kar sakta hai (C1 fix — ownership check)
 const canModify = (room, user) => user.role === 'admin' || room.userId === user.id;
 
+// Purana legacy ad? userId Mongo 24-hex NAHI hai (Google-sub digits / purana format) → orphan
+const isOrphanUserId = (v) => !/^[a-f0-9]{24}$/i.test(String(v || ''));
+
 // Indian mobile validation: 10 digits, 6-9 se shuru (91 prefix allowed)
 const cleanMobile = (raw) => {
   const digits = String(raw || '').replace(/\D/g, '');
@@ -66,6 +69,45 @@ router.get('/admin/all', requireAdmin, async (req, res) => {
     const rooms = await Room.find().sort({ createdAt: -1 });
     res.status(200).json({ success: true, rooms });
   } catch (error) { serverError(res, error, 'Admin-all error'); }
+});
+
+// --- ADMIN: purane-ad claim requests (#13 fix — mobile match hui hain, admin verify kare) ---
+router.get('/admin/claims', requireAdmin, async (req, res) => {
+  try {
+    const rooms = await Room.find({ claimRequestedAt: { $ne: null } })
+      .sort({ claimRequestedAt: -1 })
+      .select('title image price mobile ownerName userId claimRequestedBy claimRequestName claimRequestedAt');
+    res.status(200).json({ success: true, rooms });
+  } catch (error) { serverError(res, error, 'Admin-claims error'); }
+});
+
+// Approve: ad claimant ke account se link (userId swap) + claim fields clear.
+router.post('/admin/claims/:id/approve', requireAdmin, async (req, res) => {
+  try {
+    const room = await Room.findById(req.params.id);
+    if (!room) return res.status(404).json({ success: false, message: 'Room nahi mila.' });
+    if (!room.claimRequestedBy) return res.status(400).json({ success: false, message: 'Is ad par koi claim request nahi hai.' });
+    const claimant = await User.findById(room.claimRequestedBy).select('name');
+    room.userId = room.claimRequestedBy;
+    if (claimant && claimant.name) room.ownerName = claimant.name;
+    room.claimRequestedBy = null;
+    room.claimRequestName = '';
+    room.claimRequestedAt = null;
+    await room.save();
+    res.json({ success: true, message: 'Ad claimant ke account se link ho gaya.', room });
+  } catch (error) { serverError(res, error, 'Claim approve error'); }
+});
+
+router.post('/admin/claims/:id/reject', requireAdmin, async (req, res) => {
+  try {
+    const room = await Room.findById(req.params.id);
+    if (!room) return res.status(404).json({ success: false, message: 'Room nahi mila.' });
+    room.claimRequestedBy = null;
+    room.claimRequestName = '';
+    room.claimRequestedAt = null;
+    await room.save();
+    res.json({ success: true, message: 'Claim request reject kar di.' });
+  } catch (error) { serverError(res, error, 'Claim reject error'); }
 });
 
 // --- POST NEW AD (LOGIN REQUIRED — C1/C6 fix) ---
@@ -346,6 +388,63 @@ router.post('/:id/renew', requireAuth, async (req, res) => {
     await room.save();
     res.json({ success: true, message: 'Renew request bheji gayi! Payment verify hote hi ad live hoga.', room });
   } catch (error) { serverError(res, error, 'Renew error'); }
+});
+
+// --- PURANE AD CLAIM (#13 fix): step 1 — mobile se apne orphan ads dhundho ---
+// Ad ka mobile number PUBLIC hota hai, isliye mobile match akela proof nahi hai —
+// match hone par sirf claim REQUEST banti hai, final link ADMIN approve karta hai.
+router.get('/claimable', requireAuth, async (req, res) => {
+  try {
+    const clean = cleanMobile(req.query.mobile);
+    if (!clean) return res.status(400).json({ success: false, message: 'Sahi 10-digit mobile number daliye.' });
+    const candidates = await Room.find({ isActive: true })
+      .sort({ createdAt: -1 })
+      .limit(500)
+      .select('userId mobile title image price createdAt claimRequestedBy');
+    const mine = candidates.filter((r) => isOrphanUserId(r.userId) && cleanMobile(r.mobile) === clean);
+    res.json({
+      success: true,
+      rooms: mine.map((r) => ({
+        _id: r._id,
+        title: r.title,
+        image: r.image,
+        price: r.price,
+        createdAt: r.createdAt,
+        claimPending: Boolean(r.claimRequestedBy),
+        claimByMe: r.claimRequestedBy === String(req.user.id)
+      }))
+    });
+  } catch (error) { serverError(res, error, 'Claimable error'); }
+});
+
+// --- PURANE AD CLAIM: step 2 — claim request bhejo (admin verify karega) ---
+router.post('/:id/claim', requireAuth, async (req, res) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) {
+      return res.status(404).json({ success: false, message: 'Room nahi mila.' });
+    }
+    const room = await Room.findById(req.params.id);
+    if (!room) return res.status(404).json({ success: false, message: 'Room nahi mila.' });
+    if (!isOrphanUserId(room.userId)) {
+      return res.status(400).json({ success: false, message: 'Ye ad already kisi account se link hai.' });
+    }
+    if (room.claimRequestedBy === String(req.user.id)) {
+      return res.json({ success: true, message: 'Claim request pehle hi bheji hui hai — admin approval ka intezaar karein.' });
+    }
+    if (room.claimRequestedBy) {
+      return res.status(409).json({ success: false, message: 'Is ad par kisi aur ki claim request pehle se hai. Admin se baat karein.' });
+    }
+    const clean = cleanMobile(req.body && req.body.mobile);
+    if (!clean || clean !== cleanMobile(room.mobile)) {
+      return res.status(400).json({ success: false, message: 'Mobile number ad ke number se match nahi hua. Wahi number daliye jo ad par tha.' });
+    }
+    const claimant = await User.findById(req.user.id).select('name');
+    room.claimRequestedBy = String(req.user.id);
+    room.claimRequestName = (claimant && claimant.name) || '';
+    room.claimRequestedAt = new Date();
+    await room.save();
+    res.json({ success: true, message: 'Claim request bhej di! Admin verify karke ad aapke account me daal dega.' });
+  } catch (error) { serverError(res, error, 'Claim error'); }
 });
 
 // --- REPORT UNAVAILABLE (atomic + spam-guard — M1/P0 fix) ---

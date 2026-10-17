@@ -2,7 +2,7 @@ const express = require('express');
 const router = express.Router();
 const crypto = require('crypto');
 const mongoose = require('mongoose');
-const rateLimit = require('express-rate-limit');
+const { createLimiter } = require('../utils/rateStore'); // Upstash-ready
 const Admin = require('../models/Admin');
 const Settings = require('../models/Settings');
 const User = require('../models/User');
@@ -10,7 +10,8 @@ const Room = require('../models/Room');
 const { signAdmin, requireAdmin } = require('../middleware/auth');
 
 // Login par brute-force protection: 15 min me max 10 attempts (H4)
-const loginLimiter = rateLimit({
+// 🚦 Upstash Redis env set hone par shared store (serverless-safe)
+const loginLimiter = createLimiter('admin-login', {
   windowMs: 15 * 60 * 1000,
   max: 10,
   message: { success: false, message: 'Bahut zyada login attempts. 15 minute baad try karein.' }

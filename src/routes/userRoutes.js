@@ -1,31 +1,31 @@
 const express = require('express');
 const router = express.Router();
 const crypto = require('crypto');
-const rateLimit = require('express-rate-limit');
+const { createLimiter } = require('../utils/rateStore'); // Upstash-ready (env na ho toh MemoryStore)
 const { OAuth2Client } = require('google-auth-library');
 const User = require('../models/User');
 const Otp = require('../models/Otp');
 const Room = require('../models/Room');
 const Favorite = require('../models/Favorite');
-const mongoose = require('mongoose');
 const { signUser, requireAuth, requireAdmin } = require('../middleware/auth');
 const { sendOtpEmail } = require('../config/mailer');
 
 // Brute-force protection (H4): login/google par 15 min me max 20,
 // OTP maangne par 15 min me max 10 (plus per-email 3/15min andar)
-const authLimiter = rateLimit({
+// 🚦 createLimiter: Upstash Redis env set hone par shared store (serverless-safe)
+const authLimiter = createLimiter('auth', {
   windowMs: 15 * 60 * 1000,
   max: 20,
   message: { success: false, message: 'Bahut zyada attempts. 15 minute baad try karein.' }
 });
-const otpRequestLimiter = rateLimit({
+const otpRequestLimiter = createLimiter('otp-req', {
   windowMs: 15 * 60 * 1000,
   max: 10,
   message: { success: false, message: 'Bahut zyada OTP requests. 15 minute baad try karein.' }
 });
 // 🔐 P0 fix: verify-otp / reset-password par bhi limiter (pehle sirf per-record
 // 5-attempts tha — attacker naye records bana ke brute force kar sakta tha)
-const otpVerifyLimiter = rateLimit({
+const otpVerifyLimiter = createLimiter('otp-verify', {
   windowMs: 15 * 60 * 1000,
   max: 30,
   message: { success: false, message: 'Bahut zyada OTP attempts. 15 minute baad try karein.' }
@@ -266,33 +266,12 @@ router.post('/change-password', requireAuth, async (req, res) => {
   }
 });
 
-// 8. Apne puraane ads khud link karo — NO ADMIN NEEDED (self-claim)
-// Puraane system ke orphan ads (bina Mongo-ID wale) ko apne account se jodta hai.
-// Guard: sirf tab jab user ke ZERO ads hon (galat claim rokne ke liye).
-router.post('/claim-orphans', authLimiter, requireAuth, async (req, res) => {
-  try {
-    if (req.user.role === 'admin') {
-      return res.status(400).json({ success: false, message: 'Admin ko iski zaroorat nahi — migrate-rooms use karo.' });
-    }
-    const mine = await Room.countDocuments({ userId: req.user.id });
-    if (mine > 0) {
-      return res.status(400).json({ success: false, message: 'Tumhare ads already linked hain.' });
-    }
-    const allIds = await Room.distinct('userId');
-    const orphans = allIds.filter((id) => !mongoose.Types.ObjectId.isValid(id));
-    if (orphans.length === 0) {
-      return res.json({ success: true, migrated: 0, message: 'Koi puraana (bina-link) ad nahi mila.' });
-    }
-    const result = await Room.updateMany(
-      { userId: { $in: orphans } },
-      { $set: { userId: req.user.id } }
-    );
-    res.json({ success: true, migrated: result.modifiedCount, message: `${result.modifiedCount} puraane ads link ho gaye!` });
-  } catch (error) {
-    console.error('Claim-orphans error:', error.message);
-    res.status(500).json({ success: false, message: 'Server me gadbad hai. Baad me try karein.' });
-  }
-});
+// NOTE: purana `/claim-orphans` (one-tap saare legacy ads claim) HATA diya gaya (P0 #13 fix).
+// Wajah: koi bhi naya user ek click me SAARE orphan ads le leta tha — abuse-prone.
+// Naya safe flow (rooms routes me): mobile-match + admin-approval
+//   GET  /api/rooms/claimable?mobile=   → apne purane ads dhundho
+//   POST /api/rooms/:id/claim           → claim request (admin verify karega)
+//   GET/POST /api/rooms/admin/claims... → admin approve/reject
 
 // 9. Apna naam badlo (logged-in user — settings panel se)
 router.patch('/profile', requireAuth, async (req, res) => {
