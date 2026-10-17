@@ -270,8 +270,75 @@ router.post('/change-password', requireAuth, async (req, res) => {
   }
 });
 
-// NOTE: purana `/claim-orphans` (one-tap saare legacy ads claim) HATA diya gaya (P0 #13 fix).
-// Wajah: koi bhi naya user ek click me SAARE orphan ads le leta tha — abuse-prone.
+// P2 #48: Email change — password confirm + duplicate check (Google-only account me password nahi hota)
+router.post('/change-email', authLimiter, requireAuth, async (req, res) => {
+  try {
+    const { password, newEmail } = req.body || {};
+    if (!isValidEmail(newEmail)) {
+      return res.status(400).json({ success: false, message: 'Sahi naya email address daliye.' });
+    }
+    const cleanEmail = String(newEmail).toLowerCase().trim();
+    const user = await User.findById(req.user.id);
+    if (!user) return res.status(404).json({ success: false, message: 'Account nahi mila.' });
+    if (!user.password) {
+      return res.status(400).json({ success: false, message: 'Google se bane account ka email yahan se change nahi hota.' });
+    }
+    if (cleanEmail === user.email) {
+      return res.status(400).json({ success: false, message: 'Ye wahi purana email hai.' });
+    }
+    if (!password || !(await user.comparePassword(password))) {
+      return res.status(401).json({ success: false, message: 'Password galat hai!' });
+    }
+    const taken = await User.findOne({ email: cleanEmail });
+    if (taken) {
+      return res.status(409).json({ success: false, message: 'Ye email kisi aur account par pehle se hai.' });
+    }
+    user.email = cleanEmail;
+    await user.save();
+    res.json({ success: true, message: 'Email update ho gaya!', user: publicUser(user) });
+  } catch (error) {
+    console.error('Change-email error:', error.message);
+    res.status(500).json({ success: false, message: 'Server me gadbad hai. Baad me try karein.' });
+  }
+});
+
+// P2 #48: Account delete — "DELETE" confirm + (password agar hai) + rooms/favorites cleanup;
+// Cloudinary images best-effort destroy (bounded) — fail ho toh delete rukna nahi chahiye.
+router.post('/delete-account', authLimiter, requireAuth, async (req, res) => {
+  try {
+    const { password, confirm } = req.body || {};
+    if (confirm !== 'DELETE') {
+      return res.status(400).json({ success: false, message: 'Confirm ke liye DELETE likhein.' });
+    }
+    const user = await User.findById(req.user.id);
+    if (!user) return res.status(404).json({ success: false, message: 'Account nahi mila.' });
+    if (user.password && (!password || !(await user.comparePassword(password)))) {
+      return res.status(401).json({ success: false, message: 'Password galat hai!' });
+    }
+    // Delete se pehle image URLs jama karo (baad me docs gayab ho jayenge)
+    const rooms = await Room.find({ userId: user._id }).select('image images').lean();
+    const urls = [];
+    rooms.forEach((r) => {
+      if (r.image && /^https?:\/\//.test(r.image)) urls.push(r.image);
+      (r.images || []).forEach((u) => { if (u && /^https?:\/\//.test(u)) urls.push(u); });
+    });
+    await Promise.all([
+      Room.deleteMany({ userId: user._id }),
+      Favorite.deleteMany({ userId: user._id }),
+      User.deleteOne({ _id: user._id })
+    ]);
+    try {
+      const upload = require('../config/cloudinary');
+      if (urls.length > 0) await upload.destroyByUrls(urls);
+    } catch { /* orphan images maaf — account delete ho chuka */ }
+    res.json({ success: true, message: 'Account aur saare ads delete ho gaye. Alvida!' });
+  } catch (error) {
+    console.error('Delete-account error:', error.message);
+    res.status(500).json({ success: false, message: 'Server me gadbad hai. Baad me try karein.' });
+  }
+});
+
+// NOTE: purana `/claim-orphans` (one-tap saare legacy ads claim) HATA diya gaya (P0 #13 fix).// Wajah: koi bhi naya user ek click me SAARE orphan ads le leta tha — abuse-prone.
 // Naya safe flow (rooms routes me): mobile-match + admin-approval
 //   GET  /api/rooms/claimable?mobile=   → apne purane ads dhundho
 //   POST /api/rooms/:id/claim           → claim request (admin verify karega)
