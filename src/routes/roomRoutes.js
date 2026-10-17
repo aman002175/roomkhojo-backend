@@ -272,6 +272,7 @@ router.patch('/:id/banner', requireAdmin, async (req, res) => {
       const validDays = Number.isFinite(days) && days > 0 ? days : 7;
       room.isBannerActive = true;
       room.bannerExpires = new Date(Date.now() + validDays * 24 * 60 * 60 * 1000);
+      room.bannerAmount = Number((s && s.pricing && s.pricing.bannerPrice) || 0) || 0; // 💰 #56: banner revenue record
     } else {
       room.isBannerActive = false;
       room.bannerExpires = null;
@@ -401,6 +402,12 @@ router.patch('/:id/approve', requireAdmin, async (req, res) => {
     const room = await Room.findById(req.params.id);
     if (!room) return res.status(404).json({ success: false, message: 'Room nahi mila.' });
     room.isApproved = true;
+
+    // 💰 #56: payment verify hone par amount record karo (admin stats isi par based hai)
+    const st = await Settings.findOne({ key: 'app_settings' });
+    const pricing = (st && st.pricing) || {};
+    const reqPlanKey = room.promoRequested && room.promoRequested !== 'regular' ? `promo${room.promoRequested}` : 'regular';
+    room.paymentAmount = Number(pricing[reqPlanKey] || 0) || 0;
 
     if (room.promoRequested && room.promoRequested !== 'regular') {
       const newPlan = room.promoRequested;

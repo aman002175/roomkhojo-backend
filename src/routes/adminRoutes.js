@@ -168,7 +168,7 @@ router.post('/settings', requireAdmin, async (req, res) => {
 // Valid Mongo-ID wale rooms ko haath NAHI lagata (safe).
 router.post('/migrate-rooms', requireAdmin, async (req, res) => {
   try {
-    const { email } = req.body || {};
+    const { email, dryRun } = req.body || {};
     if (!email) {
       return res.status(400).json({ success: false, message: 'Email zaroori hai.' });
     }
@@ -181,6 +181,18 @@ router.post('/migrate-rooms', requireAdmin, async (req, res) => {
     if (orphanIds.length === 0) {
       return res.json({ success: true, migrated: 0, message: 'Koi puraana (bina-link) ad nahi mila. Sab linked hain.' });
     }
+    // 🛡️ #55: dry-run — pehle sirf preview (count + sample titles), koi write nahi
+    if (dryRun) {
+      const orphanCount = await Room.countDocuments({ userId: { $in: orphanIds } });
+      const sample = await Room.find({ userId: { $in: orphanIds } }).select('title mobile').sort({ createdAt: -1 }).limit(5).lean();
+      return res.json({
+        success: true,
+        dryRun: true,
+        count: orphanCount,
+        sample: sample.map((r) => ({ title: r.title, mobile: r.mobile })),
+        message: `${orphanCount} puraane ads ${user.email} se link honge.`
+      });
+    }
     const result = await Room.updateMany(
       { userId: { $in: orphanIds } },
       { $set: { userId: user._id.toString() } }
@@ -189,6 +201,55 @@ router.post('/migrate-rooms', requireAdmin, async (req, res) => {
   } catch (error) {
     console.error('Migrate error:', error.message);
     res.status(500).json({ success: false, message: 'Server me gadbad hai. Baad me try karein.' });
+  }
+});
+
+// 📊 #56: Admin stats — SERVER aggregation (promo 15/30 ka sahi price, banner revenue included).
+// NOTE: revenue sirf un ads ka jinka paymentAmount record hua hai (ye fix lagne ke baad ke approvals).
+// Puraane ads free/manual the — unki amount history reliable nahi thi, isliye unhe 0 mana jata hai.
+router.get('/stats', requireAdmin, async (req, res) => {
+  try {
+    const rooms = await Room.find({})
+      .select('userId isApproved isPromoted promoPlan promoRequested paymentAmount bannerAmount isBannerActive createdAt')
+      .lean();
+    const acc = {
+      totalAds: rooms.length, liveAds: 0, pendingAds: 0, promoAds: 0, bannerActive: 0,
+      promoRevenue: 0, bannerRevenue: 0,
+      byPlan: { regular: 0, promo7: 0, promo15: 0, promo30: 0 },
+      userIds: new Set()
+    };
+    rooms.forEach((r) => {
+      if (r.isApproved) acc.liveAds++; else acc.pendingAds++;
+      if (r.isPromoted) acc.promoAds++;
+      if (r.isBannerActive) acc.bannerActive++;
+      const amt = Number(r.paymentAmount) || 0;
+      acc.promoRevenue += amt;
+      acc.bannerRevenue += Number(r.bannerAmount) || 0;
+      if (r.promoPlan && ['7', '15', '30'].includes(String(r.promoPlan))) {
+        acc.byPlan[`promo${r.promoPlan}`] += amt;
+      } else if (r.isApproved) {
+        acc.byPlan.regular += amt;
+      }
+      if (mongoose.Types.ObjectId.isValid(r.userId)) acc.userIds.add(String(r.userId));
+    });
+    res.json({
+      success: true,
+      stats: {
+        totalAds: acc.totalAds,
+        liveAds: acc.liveAds,
+        pendingAds: acc.pendingAds,
+        promoAds: acc.promoAds,
+        bannerActive: acc.bannerActive,
+        uniqueUsers: acc.userIds.size,
+        promoRevenue: acc.promoRevenue,
+        bannerRevenue: acc.bannerRevenue,
+        totalRevenue: acc.promoRevenue + acc.bannerRevenue,
+        byPlan: acc.byPlan
+      }
+    });
+  } catch (error) {
+    console.error('Stats error:', error.message);
+    res.status(500).json({ success: false, message: 'Stats load nahi hue. Baad me try karein.' });
   }
 });
 
