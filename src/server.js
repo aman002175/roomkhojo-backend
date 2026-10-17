@@ -73,19 +73,23 @@ app.use(express.json({ limit: '10kb' }));
 app.use(mongoSanitize());
 
 // 6. XSS PROTECTION: Express 5 safe recursive sanitization (fixes getter-only req.query issues)
-const cleanXss = (val) => {
+// 🔐 P0 fix: credential fields sanitize NAHI hote — warna password me `<`/`>`
+// (ya aisa kuch jo tag-jaisa lage) chupke se badal jata tha → silent login fail.
+const XSS_EXEMPT_KEYS = new Set(['password', 'oldPassword', 'newPassword', 'currentPassword', 'confirmPassword']);
+const cleanXss = (val, key) => {
   if (typeof val === 'string') {
+    if (XSS_EXEMPT_KEYS.has(key)) return val;
     return val.replace(/<script[^>]*>([\s\S]*?)<\/script>/gi, '')
               .replace(/<[^>]*>/g, '');
   }
   if (Array.isArray(val)) {
-    return val.map(cleanXss);
+    return val.map((item) => cleanXss(item, key));
   }
   if (val && typeof val === 'object') {
     const cleanObj = {};
-    for (const key in val) {
-      if (Object.prototype.hasOwnProperty.call(val, key)) {
-        cleanObj[key] = cleanXss(val[key]);
+    for (const k in val) {
+      if (Object.prototype.hasOwnProperty.call(val, k)) {
+        cleanObj[k] = cleanXss(val[k], k);
       }
     }
     return cleanObj;

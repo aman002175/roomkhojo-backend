@@ -23,6 +23,13 @@ const otpRequestLimiter = rateLimit({
   max: 10,
   message: { success: false, message: 'Bahut zyada OTP requests. 15 minute baad try karein.' }
 });
+// 🔐 P0 fix: verify-otp / reset-password par bhi limiter (pehle sirf per-record
+// 5-attempts tha — attacker naye records bana ke brute force kar sakta tha)
+const otpVerifyLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 30,
+  message: { success: false, message: 'Bahut zyada OTP attempts. 15 minute baad try karein.' }
+});
 
 const sha256 = (val) => crypto.createHash('sha256').update(val).digest('hex');
 const publicUser = (user) => ({ id: user._id, name: user.name, email: user.email, pic: user.profilePic });
@@ -172,7 +179,7 @@ router.post('/forgot-password', otpRequestLimiter, async (req, res) => {
 });
 
 // 5. OTP Verify — sahi hone par single-use reset token (R2)
-router.post('/verify-otp', async (req, res) => {
+router.post('/verify-otp', otpVerifyLimiter, async (req, res) => {
   try {
     const { email, otp } = req.body || {};
     if (!email || !otp) {
@@ -206,7 +213,7 @@ router.post('/verify-otp', async (req, res) => {
 
 // 6. Reset Password — reset token se naya password (R3)
 // Saare puraane sessions invalidate ho jaate hain (tokenVersion bump).
-router.post('/reset-password', async (req, res) => {
+router.post('/reset-password', otpVerifyLimiter, async (req, res) => {
   try {
     const { email, resetToken, newPassword } = req.body || {};
     if (!email || !resetToken || !newPassword) {

@@ -44,6 +44,8 @@ const roomSchema = new mongoose.Schema({
   unavailableReportCount: { type: Number, default: 0 },
   // 👁 Ad kitni baar dekha gaya (D1 — dashboard me owner ko dikhta hai)
   views: { type: Number, default: 0 },
+  // 👁 View-dedupe keys (IP+din hash) — public API me kabhi nahi jayengi (P0 fix)
+  viewKeys: { type: [String], default: [], select: false },
 
   createdAt: { type: Date, default: Date.now }
 });

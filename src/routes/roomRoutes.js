@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const crypto = require('crypto');
+const mongoose = require('mongoose');
 const Room = require('../models/Room');
 const User = require('../models/User');
 const Settings = require('../models/Settings');
@@ -13,6 +14,14 @@ const cleanType = (raw) => {
   const t = String(raw || '').trim();
   return ALLOWED_TYPES.includes(t) ? t : null;
 };
+
+// 💳 Payment code: client (UPI note) ka code accept karo — dono taraf EK hi code rahe.
+// Format: RK-XXXXX (frontend makePayCode). Invalid/spoofed → null (server khud banayega).
+const cleanPayCode = (raw) => {
+  const c = String(raw || '').trim().toUpperCase();
+  return /^RK-[A-Z0-9]{4,10}$/.test(c) ? c : null;
+};
+const newPayCode = () => 'RK-' + crypto.randomBytes(3).toString('hex').toUpperCase();
 
 // 📍 Landmarks parse+validate (max 8, naam 120 chars, valid coords)
 const cleanLandmarks = (raw) => {
@@ -65,7 +74,7 @@ router.get('/admin/all', requireAdmin, async (req, res) => {
 // paymentCode server generate karta hai (client ka random code nahi).
 router.post('/', requireAuth, upload.array('images', 6), async (req, res) => {
   try {
-    const { title, price, type, category, landmark, mobile, description, lng, lat, promoPlan, paymentRef, bannerRequested, bannerRef, landmarks } = req.body || {};
+    const { title, price, type, category, landmark, mobile, description, lng, lat, promoPlan, paymentRef, paymentCode, bannerRequested, bannerRef, landmarks } = req.body || {};
 
     if (!title || !price || !type || !category) {
       return res.status(400).json({ success: false, message: 'Title, Price, Type aur Category zaroori hain.' });
@@ -126,7 +135,7 @@ router.post('/', requireAuth, upload.array('images', 6), async (req, res) => {
       ownerName,
       image: imageUrls[0] || '',
       images: imageUrls,
-      paymentCode: 'RK-' + crypto.randomBytes(3).toString('hex').toUpperCase()
+      paymentCode: cleanPayCode(paymentCode) || newPayCode()
     });
 
     // 🟢 Auto-approve: sirf FREE/regular ads, aur sirf jab admin ne toggle ON kiya ho.
@@ -151,7 +160,8 @@ router.post('/', requireAuth, upload.array('images', 6), async (req, res) => {
 // expiry filter nahi hai. (Banner strip ka alag strict filter hai.)
 router.get('/', async (req, res) => {
   try {
-    const rooms = await Room.find({ isApproved: true, isActive: true });
+    const rooms = await Room.find({ isApproved: true, isActive: true })
+      .select('-reportedIPs -paymentRef -paymentCode -bannerRef -viewKeys');
     res.status(200).json({ success: true, count: rooms.length, rooms });
   } catch (error) { serverError(res, error, 'Live-rooms error'); }
 });
@@ -165,7 +175,7 @@ router.get('/banners', async (req, res) => {
       isActive: true,
       isBannerActive: true,
       $or: [{ bannerExpires: null }, { bannerExpires: { $gte: now } }]
-    }).sort({ createdAt: -1 });
+    }).select('-reportedIPs -paymentRef -paymentCode -bannerRef -viewKeys').sort({ createdAt: -1 });
     res.json({ success: true, count: rooms.length, rooms });
   } catch (error) { serverError(res, error, 'Banners error'); }
 });
@@ -325,51 +335,61 @@ router.post('/:id/renew', requireAuth, async (req, res) => {
     if (!canModify(room, req.user)) {
       return res.status(403).json({ success: false, message: 'Access Denied! Ye ad aapka nahi hai.' });
     }
-    const { promoPlan, paymentRef } = req.body || {};
+    const { promoPlan, paymentRef, paymentCode } = req.body || {};
     if (!['7', '15', '30'].includes(promoPlan)) {
       return res.status(400).json({ success: false, message: 'Plan 7, 15 ya 30 din ka chuno.' });
     }
     room.promoRequested = promoPlan;
     room.paymentRef = String(paymentRef || '').trim().slice(0, 64);
-    room.paymentCode = 'RK-' + crypto.randomBytes(3).toString('hex').toUpperCase();
+    room.paymentCode = cleanPayCode(paymentCode) || newPayCode();
     room.isApproved = false; // Dobara admin verification (payment check)
     await room.save();
     res.json({ success: true, message: 'Renew request bheji gayi! Payment verify hote hi ad live hoga.', room });
   } catch (error) { serverError(res, error, 'Renew error'); }
 });
 
-// --- REPORT UNAVAILABLE (spam-guard ke saath — M1 fix) ---
-// Ek IP ek room ko ek hi baar report kar sakta hai.
+// --- REPORT UNAVAILABLE (atomic + spam-guard — M1/P0 fix) ---
+// IP hash se dedupe (raw IP store nahi — privacy) + atomic $push/$inc (race-safe).
 router.put('/:id/report-unavailable', async (req, res) => {
   try {
-    const room = await Room.findById(req.params.id);
-    if (!room) return res.status(404).json({ success: false, message: 'Room nahi mila.' });
-    const ip = req.ip || 'unknown';
-    if ((room.reportedIPs || []).includes(ip)) {
+    if (!mongoose.isValidObjectId(req.params.id)) {
+      return res.status(404).json({ success: false, message: 'Room nahi mila.' });
+    }
+    const ipKey = crypto.createHash('sha1').update(String(req.ip || 'unknown')).digest('hex').slice(0, 24);
+    const updated = await Room.findOneAndUpdate(
+      { _id: req.params.id, reportedIPs: { $ne: ipKey } },
+      { $push: { reportedIPs: { $each: [ipKey], $slice: -500 } }, $inc: { unavailableReportCount: 1 } },
+      { new: true }
+    );
+    if (!updated) {
+      const exists = await Room.exists({ _id: req.params.id });
+      if (!exists) return res.status(404).json({ success: false, message: 'Room nahi mila.' });
       return res.status(429).json({ success: false, message: 'Aap ye report pehle hi kar chuke hain.' });
     }
-    room.reportedIPs = [...(room.reportedIPs || []), ip].slice(-500);
-    room.unavailableReportCount = (room.unavailableReportCount || 0) + 1;
-    // 🛡️ C1: 3+ reports par ad AUTO-HIDE (review ke liye) — fake ads control
+    // 🛡️ C1: 3+ reports par ad AUTO-HIDE — race-safe (sirf tab jab abhi active ho)
     let hidden = false;
-    if (room.unavailableReportCount >= 3 && room.isActive) {
-      room.isActive = false;
-      hidden = true;
+    if (updated.unavailableReportCount >= 3 && updated.isActive) {
+      const r = await Room.updateOne({ _id: updated._id, isActive: true }, { $set: { isActive: false } });
+      hidden = r.modifiedCount > 0;
     }
-    await room.save();
     res.status(200).json({
       success: true,
       message: hidden ? 'Report noted. Ad zyada reports par auto-hide ho gaya hai.' : 'Reported successfully',
-      count: room.unavailableReportCount,
+      count: updated.unavailableReportCount,
       hidden
     });
   } catch (error) { serverError(res, error, 'Report error'); }
 });
 
-// --- AD VIEW COUNTER (public, D1) — popup khulne par +1, fail silent (UX na toote)
+// --- AD VIEW COUNTER (public, D1) — server-side dedupe (IP+din), fail silent (UX na toote)
 router.put('/:id/view', async (req, res) => {
   try {
-    await Room.findByIdAndUpdate(req.params.id, { $inc: { views: 1 } });
+    const day = new Date().toISOString().slice(0, 10);
+    const viewKey = crypto.createHash('sha1').update(`${req.ip || 'unknown'}|${day}`).digest('hex').slice(0, 24);
+    await Room.findOneAndUpdate(
+      { _id: req.params.id, viewKeys: { $ne: viewKey } },
+      { $push: { viewKeys: { $each: [viewKey], $slice: -3000 } }, $inc: { views: 1 } }
+    );
     res.json({ success: true });
   } catch { res.json({ success: false }); }
 });

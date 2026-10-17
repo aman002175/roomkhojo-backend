@@ -20,7 +20,10 @@ const settingSchema = new mongoose.Schema({
   // Promo/paid ads HAMESHA approval mangte hain (payment verify).
   autoApproveFree: { type: Boolean, default: false },
   // Admin panel ka secret path — frontend App.jsx backend se fetch karta hai
-  adminPath: { type: String, default: '/admin-secret-29' }
+  adminPath: { type: String, default: '/admin-secret-29' },
+  // 🔐 ADMIN_FORCE_RESET one-shot marker — recovery ek hi baar chale (P0 fix).
+  // Dobara force-reset chahiye ho toh DB me ye field null kar do.
+  forceResetAt: { type: Date, default: null }
 });
 
 module.exports = mongoose.model('Setting', settingSchema);

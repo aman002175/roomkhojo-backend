@@ -18,20 +18,32 @@ const loginLimiter = rateLimit({
 
 // --- Default Admin Seed (SAFE VERSION — C3 fix) ---
 // Normal: sirf tabhi banta hai jab DB me koi admin na ho.
-// Recovery: ADMIN_FORCE_RESET=true ho toh har start par env values se
-// dobara banata hai (password bhoolne par: Vercel me naya password + ye
-// flag set karo, redeploy karo, login karo, phir flag hata do).
+// Recovery: ADMIN_FORCE_RESET=true + Settings.forceResetAt khali ho tabhi ek
+// baar chalta hai (password bhoolne par: Vercel me naya password + flag set
+// karo, redeploy karo, login karke password badlo, flag hata do).
+// 🔐 P0 fix: one-shot marker — flag Vercel me bhool jao toh bhi har cold
+// start par admins delete nahi honge.
 const seedAdmin = async () => {
   try {
     const forceReset = process.env.ADMIN_FORCE_RESET === 'true';
     const count = await Admin.countDocuments();
     if (count > 0 && !forceReset) return; // Pehle se admin hai → kuch mat karo
-    if (forceReset) await Admin.deleteMany({});
+    if (forceReset) {
+      const settings = await Settings.findOne({ key: 'app_settings' });
+      if (settings && settings.forceResetAt) {
+        console.log('⚠️ ADMIN_FORCE_RESET skip — ye recovery pehle hi use ho chuki hai. Dobara chahiye toh DB me settings.forceResetAt = null karein.');
+        return;
+      }
+      await Admin.deleteMany({});
+    }
     const initialPassword = process.env.ADMIN_INITIAL_PASSWORD || crypto.randomBytes(12).toString('hex');
     await Admin.create({
       username: process.env.ADMIN_INITIAL_USERNAME || 'admin',
       password: initialPassword // Model hook ise hash karke save karega
     });
+    if (forceReset) {
+      await Settings.findOneAndUpdate({ key: 'app_settings' }, { forceResetAt: new Date() }, { upsert: true });
+    }
     console.log('✅ Default admin account banaya gaya (username: admin).');
     if (!process.env.ADMIN_INITIAL_PASSWORD) {
       console.log(`🔑 Generated admin password (login karke turant badal lena): ${initialPassword}`);
