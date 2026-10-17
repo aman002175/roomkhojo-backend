@@ -74,10 +74,12 @@ router.post('/login', authLimiter, async (req, res) => {
   try {
     const { email, password } = req.body || {};
     if (!email || !password) {
+      console.warn('Login 400: missing fields', { hasEmail: Boolean(email), hasPassword: Boolean(password) });
       return res.status(400).json({ success: false, message: 'Email aur Password dono zaroori hain.' });
     }
     const user = await User.findOne({ email: email.toLowerCase().trim() });
     if (!user || !(await user.comparePassword(password))) {
+      console.warn('Login 401: userExists=', Boolean(user));
       return res.status(401).json({ success: false, message: 'Email ya Password galat hai!' });
     }
     const token = signUser(user);
