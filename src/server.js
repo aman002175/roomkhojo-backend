@@ -136,6 +136,7 @@ app.use('/api/admin', adminRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/support', require('./routes/supportRoutes'));
 app.use('/api/cron', cronRoutes); // ⏰ P1 #22: promo/banner expiry (Vercel Cron daily)
+app.use('/api/geo', require('./routes/geoRoutes')); // 🌍 P2 #43: Overpass/Nominatim proxy + cache
 
 // --- HEALTH CHECK ROUTE ---
 app.get('/', (req, res) => {
