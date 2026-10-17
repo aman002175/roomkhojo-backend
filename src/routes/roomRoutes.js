@@ -63,6 +63,14 @@ const serverError = (res, err, label) => {
   res.status(500).json({ success: false, message: 'Server me gadbad hai. Baad me try karein.' });
 };
 
+// 🛡️ P1 #15 fix: URL me galat id (e.g. /api/rooms/abc/edit) → CastError 500 ki jagah clean 404
+router.param('id', (req, res, next, id) => {
+  if (!mongoose.isValidObjectId(id)) {
+    return res.status(404).json({ success: false, message: 'Room nahi mila.' });
+  }
+  next();
+});
+
 // --- ADMIN: saare rooms (ADMIN ONLY — pehle x-admin-secret header tha, ab JWT) ---
 router.get('/admin/all', requireAdmin, async (req, res) => {
   try {

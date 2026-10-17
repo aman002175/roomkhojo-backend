@@ -181,9 +181,24 @@ app.use((err, req, res, next) => {
   if (err.message && err.message.startsWith('CORS Error')) {
     return res.status(403).json({ success: false, message: err.message });
   }
-  // Multer upload errors — user-friendly 400 (500 nahi)
-  if (err.code === 'LIMIT_FILE_SIZE') {
-    return res.status(400).json({ success: false, message: 'Photo 2MB se chhoti honi chahiye.' });
+  // 🛡️ P1 #16: galat/toota JSON body → 400 (pehle 500 aata tha)
+  if (err.type === 'entity.parse.failed') {
+    return res.status(400).json({ success: false, message: 'Request ka data (JSON) sahi nahi hai.' });
+  }
+  // 🛡️ P1 #16: 10kb se badi body → 413
+  if (err.type === 'entity.too.large') {
+    return res.status(413).json({ success: false, message: 'Request bahut badi hai. Chhota data bhejein.' });
+  }
+  // 🛡️ P1 #18: duplicate key (E11000) → 409 (pehle 500 aata tha)
+  if (err.code === 11000) {
+    return res.status(409).json({ success: false, message: 'Ye entry pehle se mojood hai (duplicate).' });
+  }
+  // 🛡️ P1 #17: Multer upload errors → friendly 400 (500 nahi) — file size, unexpected field, count
+  if (err.name === 'MulterError') {
+    const msg = err.code === 'LIMIT_FILE_SIZE' ? 'Photo 2MB se chhoti honi chahiye.'
+      : err.code === 'LIMIT_UNEXPECTED_FILE' ? 'Max 6 photos allowed hain (field name: images).'
+        : 'Photo upload me dikkat aayi. Dobara try karein.';
+    return res.status(400).json({ success: false, message: msg });
   }
   if (err.message === 'Sirf JPG, PNG ya WebP photo allowed hai.') {
     return res.status(400).json({ success: false, message: err.message });

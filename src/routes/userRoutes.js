@@ -7,6 +7,7 @@ const User = require('../models/User');
 const Otp = require('../models/Otp');
 const Room = require('../models/Room');
 const Favorite = require('../models/Favorite');
+const mongoose = require('mongoose');
 const { signUser, requireAuth, requireAdmin } = require('../middleware/auth');
 const { sendOtpEmail } = require('../config/mailer');
 
@@ -309,6 +310,9 @@ router.get('/favorites', requireAuth, async (req, res) => {
 // 11. ❤️ Save/Unsave toggle
 router.post('/favorites/:roomId/toggle', requireAuth, async (req, res) => {
   try {
+    if (!mongoose.isValidObjectId(req.params.roomId)) { // P1 #15: galat id → 500 nahi
+      return res.status(404).json({ success: false, message: 'Room nahi mila.' });
+    }
     const room = await Room.findById(req.params.roomId);
     if (!room) return res.status(404).json({ success: false, message: 'Room nahi mila.' });
     const existing = await Favorite.findOne({ userId: req.user.id, roomId: room._id });
