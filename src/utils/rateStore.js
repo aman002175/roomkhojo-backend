@@ -5,15 +5,18 @@
 // ek shared counter rakhta hai — sirf GINTI (rate-limit counters), data nahi.
 // Rooms/users/ads hamesha MongoDB se hi aate hain — yahan koi app-data cache NAHI hai.
 //
-// Env vars (Vercel → backend project → Environment Variables):
-//   UPSTASH_REDIS_REST_URL   = https://xxx.upstash.io
+// Env vars (Vercel → backend project → Environment Variables) — DO names kaam karte hain:
+//   UPSTASH_REDIS_REST_URL   = https://xxx.upstash.io   (Upstash direct)
 //   UPSTASH_REDIS_REST_TOKEN = Axxxx...
+//   ya KV_REST_API_URL / KV_REST_API_TOKEN              (Vercel KV / Vercel Marketplace style)
 //
 // Env vars na hon (ya Redis down ho) → purana MemoryStore / fail-open (app kabhi na rukey).
+// NOTE: Purana Upstash Redis kisi dusre project me use ho raha ho toh WAHI DB reuse kar
+// sakte ho — hamare saare keys `rk:rl:` namespace me hain, dusre project se mix nahi honge.
 const rateLimit = require('express-rate-limit');
 
-const UPSTASH_URL = process.env.UPSTASH_REDIS_REST_URL;
-const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
+const UPSTASH_URL = process.env.UPSTASH_REDIS_REST_URL || process.env.KV_REST_API_URL;
+const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || process.env.KV_REST_API_TOKEN;
 const upstashEnabled = Boolean(UPSTASH_URL && UPSTASH_TOKEN);
 
 // Upstash REST: ek HTTP call me multiple commands (INCR + EXPIRE atomic-ish)
