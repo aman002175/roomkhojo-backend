@@ -19,6 +19,8 @@ const settingSchema = new mongoose.Schema({
   // 🟢 Free/regular ads bina admin-approval ke live? (admin toggle)
   // Promo/paid ads HAMESHA approval mangte hain (payment verify).
   autoApproveFree: { type: Boolean, default: false },
+  // 📞 P1: 1 user 1 din me kitne owner numbers reveal kar sakta hai (admin editable)
+  contactRevealLimit: { type: Number, default: 15 },
   // Admin panel ka secret path — frontend App.jsx backend se fetch karta hai
   adminPath: { type: String, default: '/admin-secret-29' },
   // 🔐 ADMIN_FORCE_RESET one-shot marker — recovery ek hi baar chale (P0 fix).

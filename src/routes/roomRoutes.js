@@ -6,6 +6,7 @@ const Room = require('../models/Room');
 const User = require('../models/User');
 const Settings = require('../models/Settings');
 const upload = require('../config/cloudinary');
+const ContactReveal = require('../models/ContactReveal');
 const { requireAuth, requireAdmin } = require('../middleware/auth');
 
 // Audience types (category-wise frontend options ka union — backend guard)
@@ -76,6 +77,66 @@ const serverError = (res, err, label) => {
 };
 
 // 🛡️ P1 #15 fix: URL me galat id (e.g. /api/rooms/abc/edit) → CastError 500 ki jagah clean 404
+// 🗺️ Google Maps link (optional) — sirf Google domains allowed (SSRF-safe)
+const cleanMapUrl = (raw) => {
+  const s = String(raw || '').trim();
+  if (!s) return '';
+  if (s.length > 300) return null;
+  let u;
+  try { u = new URL(s); } catch { return null; }
+  if (u.protocol !== 'https:' && u.protocol !== 'http:') return null;
+  if (u.username || u.password) return null;
+  const host = u.hostname.toLowerCase();
+  const isGoogle = /(^|\.)google\.[a-z]{2,}(\.[a-z]{2,})?$/.test(host);
+  const isShort = host === 'goo.gl' || host === 'maps.app.goo.gl';
+  if (!isGoogle && !isShort) return null;
+  return u.toString();
+};
+
+// Link ke andar embedded coordinates nikaalo (short links ko expand karke bhi try)
+const MAP_COORD_PATTERNS = [
+  /@(-?\d{1,3}\.\d+),(-?\d{1,3}\.\d+)/,
+  /[?&](?:q|query|ll|sll|destination)=(-?\d{1,3}\.\d+),(-?\d{1,3}\.\d+)/,
+  /!3d(-?\d{1,3}\.\d+)!4d(-?\d{1,3}\.\d+)/
+];
+const coordsFromText = (text) => {
+  const str = String(text || '');
+  for (const re of MAP_COORD_PATTERNS) {
+    const m = str.match(re);
+    if (m) {
+      const lat = Number(m[1]);
+      const lng = Number(m[2]);
+      if (Number.isFinite(lat) && Number.isFinite(lng) && lat >= -90 && lat <= 90 && lng >= -180 && lng <= 180) {
+        return { lat, lng };
+      }
+    }
+  }
+  return null;
+};
+const coordsFromMapUrl = async (urlStr) => {
+  const direct = coordsFromText(urlStr);
+  if (direct) return direct;
+  // goo.gl / maps.app.goo.gl short link → expand (5s timeout, sirf Google hosts)
+  try {
+    const res = await fetch(urlStr, {
+      redirect: 'follow',
+      signal: AbortSignal.timeout(5000),
+      headers: { 'User-Agent': 'RoomKhojo/1.0 (+https://roomkhojoo.vercel.app)' }
+    });
+    const fromFinalUrl = coordsFromText(res.url || '');
+    if (fromFinalUrl) return fromFinalUrl;
+    const html = await res.text();
+    return coordsFromText(html.slice(0, 200000));
+  } catch { return null; }
+};
+
+// 📞 Number reveal: IST din + per-user daily limit (admin setting se)
+const istDateKey = () => new Date(Date.now() + 5.5 * 60 * 60 * 1000).toISOString().slice(0, 10);
+const revealLimit = (settings) => {
+  const n = Number(settings && settings.contactRevealLimit);
+  return Number.isFinite(n) && n >= 1 && n <= 100 ? Math.floor(n) : 15;
+};
+
 router.param('id', (req, res, next, id) => {
   if (!mongoose.isValidObjectId(id)) {
     return res.status(404).json({ success: false, message: 'Room nahi mila.' });
@@ -148,7 +209,7 @@ router.post('/', requireAuth, upload.array('images', 6), async (req, res) => {
         return res.status(429).json({ success: false, message: 'Ek din me max 10 ads post kar sakte ho. 24 ghante baad dobara try karo.' });
       }
     }
-    const { title, price, type, category, landmark, mobile, description, lng, lat, promoPlan, paymentRef, paymentCode, bannerRequested, bannerRef, landmarks } = req.body || {};
+    const { title, price, type, category, landmark, mobile, description, lng, lat, promoPlan, paymentRef, paymentCode, bannerRequested, bannerRef, landmarks, googleMapUrl } = req.body || {};
 
     if (!title || !price || !type || !category) {
       return res.status(400).json({ success: false, message: 'Title, Price, Type aur Category zaroori hain.' });
@@ -165,10 +226,22 @@ router.post('/', requireAuth, upload.array('images', 6), async (req, res) => {
     if (!cleanPriceVal) {
       return res.status(400).json({ success: false, message: 'Price sirf number hona chahiye (jaise 3000).' });
     }
-    const cleanLng = toCoord(lng, -180, 180);
-    const cleanLat = toCoord(lat, -90, 90);
+    // 🗺️ Optional Google Maps link — link me coords milen toh wahi use karo (zyada accurate)
+    let mapLink = '';
+    if (googleMapUrl !== undefined && googleMapUrl !== null) {
+      mapLink = cleanMapUrl(googleMapUrl);
+      if (mapLink === null) {
+        return res.status(400).json({ success: false, message: 'Google Maps link sahi nahi hai. Sirf maps.google.com / maps.app.goo.gl links chalenge.' });
+      }
+    }
+    let cleanLng = toCoord(lng, -180, 180);
+    let cleanLat = toCoord(lat, -90, 90);
+    if (mapLink) {
+      const fromLink = await coordsFromMapUrl(mapLink);
+      if (fromLink) { cleanLat = fromLink.lat; cleanLng = fromLink.lng; }
+    }
     if (cleanLng === null || cleanLat === null) {
-      return res.status(400).json({ success: false, message: 'Map par sahi location select karein.' });
+      return res.status(400).json({ success: false, message: 'Map par location select karein ya Google Maps link daalein.' });
     }
     const requestedPlan = ['regular', '7', '15', '30'].includes(promoPlan) ? promoPlan : 'regular';
 
@@ -210,6 +283,7 @@ router.post('/', requireAuth, upload.array('images', 6), async (req, res) => {
       isBannerActive: false,
       // 📍 User-selected nearby landmarks
       landmarks: cleanLandmarks(landmarks),
+      googleMapUrl: mapLink,
       userId: req.user.id,
       ownerName,
       image: imageUrls[0] || '',
@@ -248,7 +322,7 @@ router.get('/', async (req, res) => {
   try {
     // P1 #19: unbounded dump band — cap 1000 + lean (map par isse zyada pins ka koi fayda nahi)
     const rooms = await Room.find({ isApproved: true, isActive: true })
-      .select('-reportedBy -userId -paymentRef -paymentCode -bannerRef -viewKeys') // P2-4: owner userId public nahi
+      .select('-reportedBy -userId -paymentRef -paymentCode -bannerRef -viewKeys -mobile') // P2-4 + mobile private (reveal API se)
       .sort({ createdAt: -1 }).limit(1000).lean();
     res.status(200).json({ success: true, count: rooms.length, rooms });
   } catch (error) { serverError(res, error, 'Live-rooms error'); }
@@ -263,9 +337,59 @@ router.get('/banners', async (req, res) => {
       isActive: true,
       isBannerActive: true,
       $or: [{ bannerExpires: null }, { bannerExpires: { $gte: now } }]
-    }).select('-reportedBy -userId -paymentRef -paymentCode -bannerRef -viewKeys').sort({ createdAt: -1 }).limit(50).lean(); // P1 #19 (top strip chhota hota hai)
+    }).select('-reportedBy -userId -paymentRef -paymentCode -bannerRef -viewKeys -mobile').sort({ createdAt: -1 }).limit(50).lean(); // P1 #19 (top strip chhota hota hai)
     res.json({ success: true, count: rooms.length, rooms });
   } catch (error) { serverError(res, error, 'Banners error'); }
+});
+
+// 📞 P1: number-reveal usage — user ko pata rahe daily limit me kitne bache hain
+router.get('/contact-usage', requireAuth, async (req, res) => {
+  try {
+    const settings = await Settings.findOne({ key: 'app_settings' }).lean();
+    const limit = revealLimit(settings);
+    const used = await ContactReveal.countDocuments({ userId: req.user.id, date: istDateKey() });
+    res.json({ success: true, used, limit, remaining: Math.max(0, limit - used) });
+  } catch (error) { serverError(res, error, 'Contact-usage error'); }
+});
+
+// 📞 P1: logged-in user number reveal kare (daily limit + same ad dobara kholna free)
+router.get('/:id/contact', requireAuth, async (req, res) => {
+  try {
+    const room = await Room.findById(req.params.id).select('mobile isApproved isActive userId').lean();
+    if (!room || !room.mobile) {
+      return res.status(404).json({ success: false, message: 'Is ad ka number available nahi hai.' });
+    }
+    const isOwner = room.userId === req.user.id;
+    if (!isOwner && req.user.role !== 'admin' && !(room.isApproved && room.isActive)) {
+      return res.status(404).json({ success: false, message: 'Ye ad ab live nahi hai.' });
+    }
+    const date = istDateKey();
+    const settings = await Settings.findOne({ key: 'app_settings' }).lean();
+    const limit = revealLimit(settings);
+    const already = await ContactReveal.exists({ userId: req.user.id, roomId: req.params.id, date });
+    if (!already) {
+      const used = await ContactReveal.countDocuments({ userId: req.user.id, date });
+      if (used >= limit) {
+        return res.status(429).json({
+          success: false,
+          message: `Aaj ka number-reveal limit khatam ho gaya (${used}/${limit}). Kal dobara try karo.`,
+          used, limit, remaining: 0
+        });
+      }
+      try {
+        await ContactReveal.create({ userId: req.user.id, roomId: req.params.id, date });
+      } catch { /* unique-race: pehle se revealed — count dobara nahi badhta */ }
+    }
+    const usedNow = await ContactReveal.countDocuments({ userId: req.user.id, date });
+    res.json({
+      success: true,
+      mobile: room.mobile,
+      whatsapp: room.mobile,
+      used: usedNow,
+      limit,
+      remaining: Math.max(0, limit - usedNow)
+    });
+  } catch (error) { serverError(res, error, 'Contact-reveal error'); }
 });
 
 // --- ADMIN: banner approve/revoke (payment verify ke baad) ---
@@ -359,6 +483,19 @@ router.put('/:id/edit', requireAuth, upload.array('images', 6), async (req, res)
       const cleanLat = toCoord(req.body.lat, -90, 90);
       if (cleanLat === null) return res.status(400).json({ success: false, message: 'Sahi location select karein.' });
       room.lat = cleanLat;
+    }
+
+    // 🗺️ Google Maps link (optional) — link mile toh coords bhi update (accurate location)
+    if (req.body.googleMapUrl !== undefined) {
+      const link = cleanMapUrl(req.body.googleMapUrl);
+      if (link === null) {
+        return res.status(400).json({ success: false, message: 'Google Maps link sahi nahi hai.' });
+      }
+      room.googleMapUrl = link;
+      if (link) {
+        const fromLink = await coordsFromMapUrl(link);
+        if (fromLink) { room.lat = fromLink.lat; room.lng = fromLink.lng; }
+      }
     }
 
     // 📸 Gallery: keep-list (sirf mevcut photos me se) + naye uploads, max 6

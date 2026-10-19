@@ -49,6 +49,8 @@ const roomSchema = new mongoose.Schema({
   claimRequestedBy: { type: String, default: null },   // claimant ka Mongo user id
   claimRequestName: { type: String, default: '' },      // admin ko verify karne ke liye naam
   claimRequestedAt: { type: Date, default: null },
+  // 🗺️ Optional Google Maps link — location accuracy ke liye (public)
+  googleMapUrl: { type: String, default: '' },
   expiryDate: { type: Date, default: null },
   unavailableReportCount: { type: Number, default: 0 },
   // 👁 Ad kitni baar dekha gaya (D1 — dashboard me owner ko dikhta hai)

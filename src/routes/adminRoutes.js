@@ -134,13 +134,20 @@ const cleanAdminPath = (raw) => {
 
 router.post('/settings', requireAdmin, async (req, res) => {
   try {
-    const { categories, facilities, pricing, adminPath, autoApproveFree } = req.body || {};
+    const { categories, facilities, pricing, adminPath, autoApproveFree, contactRevealLimit } = req.body || {};
 
     const update = {};
     if (categories !== undefined) update.categories = categories;
     if (facilities !== undefined) update.facilities = facilities;
     if (pricing !== undefined) update.pricing = pricing;
     if (autoApproveFree !== undefined) update.autoApproveFree = autoApproveFree === true || autoApproveFree === 'true';
+    if (contactRevealLimit !== undefined) {
+      const limit = Number(contactRevealLimit);
+      if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+        return res.status(400).json({ success: false, message: 'Number reveal limit 1 se 100 ke beech honi chahiye.' });
+      }
+      update.contactRevealLimit = limit;
+    }
     if (adminPath !== undefined) {
       const clean = cleanAdminPath(adminPath);
       if (!clean) {
