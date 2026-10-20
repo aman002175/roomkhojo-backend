@@ -7,6 +7,7 @@ const User = require('../models/User');
 const Otp = require('../models/Otp');
 const Room = require('../models/Room');
 const Favorite = require('../models/Favorite');
+const ConsentLog = require('../models/ConsentLog');
 const mongoose = require('mongoose');
 const { signUser, requireAuth, requireAdmin } = require('../middleware/auth');
 const { sendOtpEmail } = require('../config/mailer');
@@ -63,6 +64,8 @@ router.post('/signup', authLimiter, async (req, res) => {
       return res.status(400).json({ success: false, message: 'Ye Email pehle se registered hai!' });
     }
     const newUser = await User.create({ name, email, password, termsAcceptedAt: new Date(), termsVersion: TERMS_VERSION }); // Model hook hash karega
+    // 🧾 Consent proof (hashed) — account delete ke baad bhi 180 din tak retention
+    ConsentLog.create({ emailHash: sha256(email.toLowerCase().trim()), termsVersion: TERMS_VERSION }).catch(() => {});
     const token = signUser(newUser);
     res.status(201).json({ success: true, message: 'Account ban gaya!', token, user: publicUser(newUser) });
   } catch (error) {
@@ -86,6 +89,9 @@ router.post('/login', authLimiter, async (req, res) => {
     }
     // Login par checkbox tick tha → consent proof update (acceptedTerms FE bhejta hai)
     if (req.body && req.body.acceptedTerms === true) {
+      if (user.termsVersion !== TERMS_VERSION) {
+        ConsentLog.create({ emailHash: sha256(user.email.toLowerCase().trim()), termsVersion: TERMS_VERSION }).catch(() => {});
+      }
       user.termsAcceptedAt = new Date();
       user.termsVersion = TERMS_VERSION;
       await user.save();
@@ -128,8 +134,12 @@ router.post('/google', authLimiter, async (req, res) => {
         termsAcceptedAt: new Date(),
         termsVersion: TERMS_VERSION
       });
+      ConsentLog.create({ emailHash: sha256(payload.email.toLowerCase()), termsVersion: TERMS_VERSION }).catch(() => {});
     } else if (req.body && req.body.acceptedTerms === true) {
       // Existing user: checkbox tick tha → consent proof refresh
+      if (user.termsVersion !== TERMS_VERSION) {
+        ConsentLog.create({ emailHash: sha256(user.email.toLowerCase()), termsVersion: TERMS_VERSION }).catch(() => {});
+      }
       user.termsAcceptedAt = new Date();
       user.termsVersion = TERMS_VERSION;
       await user.save();
@@ -343,6 +353,11 @@ router.post('/delete-account', authLimiter, requireAuth, async (req, res) => {
       Favorite.deleteMany({ userId: user._id }),
       User.deleteOne({ _id: user._id })
     ]);
+    // 🧾 Consent withdrawal ka proof (hashed) — 180 din baad cleanup cron delete karega
+    ConsentLog.updateMany(
+      { emailHash: sha256(String(user.email).toLowerCase().trim()), withdrawnAt: null },
+      { $set: { withdrawnAt: new Date() } }
+    ).catch(() => {});
     try {
       const upload = require('../config/cloudinary');
       if (urls.length > 0) await upload.destroyByUrls(urls);
