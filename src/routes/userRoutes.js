@@ -42,6 +42,8 @@ const sha256 = (val) => crypto.createHash('sha256').update(val).digest('hex');
 const publicUser = (user) => ({ id: user._id, name: user.name, email: user.email, pic: user.profilePic });
 // Basic email-format check (nodemailer addressparser abuse + galat input rokne ke liye)
 const isValidEmail = (email) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(email || '').trim());
+// Legal documents ka current version — consent proof ke liye user par save hota hai
+const TERMS_VERSION = '2026-10';
 
 // 1. Email & Password Signup (bcrypt hash + JWT — C4/C7 fix)
 router.post('/signup', authLimiter, async (req, res) => {
@@ -60,7 +62,7 @@ router.post('/signup', authLimiter, async (req, res) => {
     if (existingUser) {
       return res.status(400).json({ success: false, message: 'Ye Email pehle se registered hai!' });
     }
-    const newUser = await User.create({ name, email, password, termsAcceptedAt: new Date() }); // Model hook hash karega
+    const newUser = await User.create({ name, email, password, termsAcceptedAt: new Date(), termsVersion: TERMS_VERSION }); // Model hook hash karega
     const token = signUser(newUser);
     res.status(201).json({ success: true, message: 'Account ban gaya!', token, user: publicUser(newUser) });
   } catch (error) {
@@ -81,6 +83,12 @@ router.post('/login', authLimiter, async (req, res) => {
     if (!user || !(await user.comparePassword(password))) {
       console.warn('Login 401: userExists=', Boolean(user));
       return res.status(401).json({ success: false, message: 'Email ya Password galat hai!' });
+    }
+    // Login par checkbox tick tha → consent proof update (acceptedTerms FE bhejta hai)
+    if (req.body && req.body.acceptedTerms === true) {
+      user.termsAcceptedAt = new Date();
+      user.termsVersion = TERMS_VERSION;
+      await user.save();
     }
     const token = signUser(user);
     res.json({ success: true, message: `Welcome ${user.name}!`, token, user: publicUser(user) });
@@ -117,8 +125,14 @@ router.post('/google', authLimiter, async (req, res) => {
         email: payload.email,
         profilePic: payload.picture || '',
         isGoogleUser: true,
-        termsAcceptedAt: new Date()
+        termsAcceptedAt: new Date(),
+        termsVersion: TERMS_VERSION
       });
+    } else if (req.body && req.body.acceptedTerms === true) {
+      // Existing user: checkbox tick tha → consent proof refresh
+      user.termsAcceptedAt = new Date();
+      user.termsVersion = TERMS_VERSION;
+      await user.save();
     }
 
     const token = signUser(user);
