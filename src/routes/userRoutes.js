@@ -199,7 +199,9 @@ router.post('/forgot-password', otpRequestLimiter, async (req, res) => {
       if (mailErr.code === 'EMAIL_NOT_CONFIGURED') {
         return res.status(503).json({ success: false, message: 'Email service abhi setup nahi hai. Admin se sampark karein.' });
       }
-      throw mailErr;
+      // SMTP auth/network fail — user ko saaf message (generic 500 nahi)
+      console.error('OTP mail send failed:', mailErr.message);
+      return res.status(502).json({ success: false, message: 'OTP email bhejne me dikkat aayi. Thodi der baad try karein.' });
     }
     return done();
   } catch (error) {
