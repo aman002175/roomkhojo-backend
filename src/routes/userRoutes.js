@@ -45,6 +45,19 @@ const publicUser = (user) => ({ id: user._id, name: user.name, email: user.email
 const isValidEmail = (email) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(email || '').trim());
 // Legal documents ka current version — consent proof ke liye user par save hota hai
 const TERMS_VERSION = '2026-10';
+// Weak/common passwords — signup/reset/change par block (8+ chars base requirement)
+const WEAK_PASSWORDS = new Set([
+  'password', 'password1', 'password123', '12345678', '123456789', '1234567890',
+  'qwerty123', 'qwertyuiop', 'iloveyou', 'admin123', 'welcome1', 'abc12345',
+  'roomkhojo', 'roomkhojoo', 'letmein1', 'changeme', 'a1234567'
+]);
+const isWeakPassword = (pw) => {
+  const v = String(pw || '');
+  if (WEAK_PASSWORDS.has(v.toLowerCase())) return true;
+  if (/^(.)\1+$/.test(v)) return true; // sab same character
+  if (/^(0123456789|9876543210|abcdefgh|12345678|87654321)/.test(v.toLowerCase())) return true;
+  return false;
+};
 
 // 1. Email & Password Signup (bcrypt hash + JWT — C4/C7 fix)
 router.post('/signup', authLimiter, async (req, res) => {
@@ -56,8 +69,11 @@ router.post('/signup', authLimiter, async (req, res) => {
     if (!isValidEmail(email)) {
       return res.status(400).json({ success: false, message: 'Sahi email address daliye.' });
     }
-    if (password.length < 6) {
-      return res.status(400).json({ success: false, message: 'Password kam se kam 6 characters ka ho.' });
+    if (password.length < 8) {
+      return res.status(400).json({ success: false, message: 'Password kam se kam 8 characters ka ho.' });
+    }
+    if (isWeakPassword(password)) {
+      return res.status(400).json({ success: false, message: 'Ye password bahut common hai. Strong password chunein.' });
     }
     const existingUser = await User.findOne({ email: email.toLowerCase().trim() });
     if (existingUser) {
@@ -251,8 +267,11 @@ router.post('/reset-password', otpVerifyLimiter, async (req, res) => {
     if (!email || !resetToken || !newPassword) {
       return res.status(400).json({ success: false, message: 'Email, token aur naya password zaroori hain.' });
     }
-    if (newPassword.length < 6) {
-      return res.status(400).json({ success: false, message: 'Password kam se kam 6 characters ka ho.' });
+    if (newPassword.length < 8) {
+      return res.status(400).json({ success: false, message: 'Password kam se kam 8 characters ka ho.' });
+    }
+    if (isWeakPassword(newPassword)) {
+      return res.status(400).json({ success: false, message: 'Ye password bahut common hai. Strong password chunein.' });
     }
     const record = await Otp.findOne({ email: email.toLowerCase().trim() });
     if (!record || !record.resetTokenHash || !record.resetExpires || record.resetExpires < new Date()
@@ -281,8 +300,11 @@ router.post('/change-password', requireAuth, async (req, res) => {
     if (!oldPassword || !newPassword) {
       return res.status(400).json({ success: false, message: 'Puraana aur naya password dono zaroori hain.' });
     }
-    if (newPassword.length < 6) {
-      return res.status(400).json({ success: false, message: 'Password kam se kam 6 characters ka ho.' });
+    if (newPassword.length < 8) {
+      return res.status(400).json({ success: false, message: 'Password kam se kam 8 characters ka ho.' });
+    }
+    if (isWeakPassword(newPassword)) {
+      return res.status(400).json({ success: false, message: 'Ye password bahut common hai. Strong password chunein.' });
     }
     const user = await User.findById(req.user.id);
     if (!user || !(await user.comparePassword(oldPassword))) {
