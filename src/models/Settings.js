@@ -14,7 +14,9 @@ const settingSchema = new mongoose.Schema({
     upiId: { type: String, default: '9145891108@ikwik' },
     // 🎯 Banner add-on: kitna charge + kitne din (admin editable)
     bannerPrice: { type: String, default: '499' },
-    bannerDays: { type: String, default: '7' }
+    bannerDays: { type: String, default: '7' },
+    // 🧾 Service provider listing: admin-controlled per-day rate (0 = free)
+    serviceDailyRate: { type: String, default: '0' }
   },
   // 🟢 Free/regular ads bina admin-approval ke live? (admin toggle)
   // Promo/paid ads HAMESHA approval mangte hain (payment verify).

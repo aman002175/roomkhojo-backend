@@ -249,6 +249,23 @@ router.post('/', requireAuth, upload.array('images', 6), async (req, res) => {
     }
     const requestedPlan = ['regular', '7', '15', '30'].includes(promoPlan) ? promoPlan : 'regular';
 
+    // 🧾 Service provider listing fee: duration provider chunta hai, rate admin control karta hai.
+    // Fee hamesha server calculate karta hai (client ka bheja amount ignore).
+    let serviceDays = 0;
+    if (isService) {
+      const days = Number(req.body.serviceDays);
+      if (!Number.isInteger(days) || days < 1 || days > 365) {
+        return res.status(400).json({ success: false, message: 'Service listing duration 1 se 365 din ke beech chunein.' });
+      }
+      serviceDays = days;
+    }
+    const appSettings = await Settings.findOne({ key: 'app_settings' }).lean();
+    const rawServiceRate = Number(appSettings && appSettings.pricing && appSettings.pricing.serviceDailyRate);
+    const serviceDailyRate = isService && Number.isFinite(rawServiceRate) && rawServiceRate > 0
+      ? Math.min(100000, Math.floor(rawServiceRate))
+      : 0;
+    const serviceFee = isService ? serviceDailyRate * serviceDays : 0;
+
     let ownerName = 'Owner';
     if (req.user.role !== 'admin') {
       const owner = await User.findById(req.user.id);
@@ -286,6 +303,10 @@ router.post('/', requireAuth, upload.array('images', 6), async (req, res) => {
       bannerRequested: bannerRequested === 'true' || bannerRequested === true,
       bannerRef: String(bannerRef || paymentRef || '').trim().slice(0, 64),
       isBannerActive: false,
+      // 🧾 Service listing duration + admin rate snapshot (approval par expiry set hogi)
+      serviceDays,
+      serviceDailyRate,
+      serviceFee,
       // 📍 User-selected nearby landmarks
       landmarks: cleanLandmarks(landmarks),
       googleMapUrl: mapLink,
@@ -298,9 +319,8 @@ router.post('/', requireAuth, upload.array('images', 6), async (req, res) => {
 
     // 🟢 Auto-approve: sirf FREE/regular ads, aur sirf jab admin ne toggle ON kiya ho.
     // Promo/banner wale HAMESHA pending (payment verify hoga).
-    const wantsPaid = requestedPlan !== 'regular' || newRoom.bannerRequested;
-    if (!wantsPaid) {
-      const appSettings = await Settings.findOne({ key: 'app_settings' });
+    const wantsPaid = requestedPlan !== 'regular' || newRoom.bannerRequested || serviceFee > 0;
+    if (!wantsPaid && !isService) {
       if (appSettings && appSettings.autoApproveFree) newRoom.isApproved = true;
     }
 
@@ -325,8 +345,18 @@ router.post('/', requireAuth, upload.array('images', 6), async (req, res) => {
 // expiry filter nahi hai. (Banner strip ka alag strict filter hai.)
 router.get('/', async (req, res) => {
   try {
+    const now = new Date();
+    // Service provider listing apni chosen duration ke baad public list se hat jati hai.
     // P1 #19: unbounded dump band — cap 1000 + lean (map par isse zyada pins ka koi fayda nahi)
-    const rooms = await Room.find({ isApproved: true, isActive: true })
+    const rooms = await Room.find({
+      isApproved: true,
+      isActive: true,
+      $or: [
+        { listingType: { $ne: 'service' } },
+        { serviceExpiresAt: null },
+        { serviceExpiresAt: { $gte: now } }
+      ]
+    })
       .select('-reportedBy -userId -paymentRef -paymentCode -bannerRef -viewKeys -mobile') // P2-4 + mobile private (reveal API se)
       .sort({ createdAt: -1 }).limit(1000).lean();
     res.status(200).json({ success: true, count: rooms.length, rooms });
@@ -343,7 +373,7 @@ router.get('/banners', async (req, res) => {
       isActive: true,
       $or: [
         { isBannerActive: true, $or: [{ bannerExpires: null }, { bannerExpires: { $gte: now } }] },
-        { listingType: 'service' }
+        { listingType: 'service', $or: [{ serviceExpiresAt: null }, { serviceExpiresAt: { $gte: now } }] }
       ]
     }).select('-reportedBy -userId -paymentRef -paymentCode -bannerRef -viewKeys -mobile').sort({ createdAt: -1 }).limit(50).lean(); // P1 #19 (top strip chhota hota hai)
     res.json({ success: true, count: rooms.length, rooms });
@@ -363,12 +393,13 @@ router.get('/contact-usage', requireAuth, async (req, res) => {
 // 📞 P1: logged-in user number reveal kare (daily limit + same ad dobara kholna free)
 router.get('/:id/contact', requireAuth, async (req, res) => {
   try {
-    const room = await Room.findById(req.params.id).select('mobile isApproved isActive userId').lean();
+    const room = await Room.findById(req.params.id).select('mobile isApproved isActive userId listingType serviceExpiresAt').lean();
     if (!room || !room.mobile) {
       return res.status(404).json({ success: false, message: 'Is ad ka number available nahi hai.' });
     }
     const isOwner = room.userId === req.user.id;
-    if (!isOwner && req.user.role !== 'admin' && !(room.isApproved && room.isActive)) {
+    const serviceExpired = room.listingType === 'service' && room.serviceExpiresAt && new Date(room.serviceExpiresAt) <= new Date();
+    if (!isOwner && req.user.role !== 'admin' && (!(room.isApproved && room.isActive) || serviceExpired)) {
       return res.status(404).json({ success: false, message: 'Ye ad ab live nahi hai.' });
     }
     const date = istDateKey();
@@ -560,10 +591,21 @@ router.patch('/:id/approve', requireAdmin, async (req, res) => {
     // 💰 #56: payment verify hone par amount record karo (admin stats isi par based hai)
     const st = await Settings.findOne({ key: 'app_settings' });
     const pricing = (st && st.pricing) || {};
-    const reqPlanKey = room.promoRequested && room.promoRequested !== 'regular' ? `promo${room.promoRequested}` : 'regular';
-    room.paymentAmount = Number(pricing[reqPlanKey] || 0) || 0;
+    if (room.listingType === 'service') {
+      // Service fee submit-time snapshot hai — approve par amount dobara mat badlo.
+      room.paymentAmount = Number(room.serviceFee) || 0;
+      // Timer admin approval se shuru: provider ko review time ka loss nahi.
+      if (!room.serviceExpiresAt && Number(room.serviceDays) > 0) {
+        const start = new Date();
+        room.serviceStartsAt = start;
+        room.serviceExpiresAt = new Date(start.getTime() + Number(room.serviceDays) * 24 * 60 * 60 * 1000);
+      }
+    } else {
+      const reqPlanKey = room.promoRequested && room.promoRequested !== 'regular' ? `promo${room.promoRequested}` : 'regular';
+      room.paymentAmount = Number(pricing[reqPlanKey] || 0) || 0;
+    }
 
-    if (room.promoRequested && room.promoRequested !== 'regular') {
+    if (room.listingType !== 'service' && room.promoRequested && room.promoRequested !== 'regular') {
       const newPlan = room.promoRequested;
       const planChanged = room.promoPlan !== newPlan;
       room.isPromoted = true;

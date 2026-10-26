@@ -143,7 +143,17 @@ router.post('/settings', requireAdmin, async (req, res) => {
     const update = {};
     if (categories !== undefined) update.categories = categories;
     if (facilities !== undefined) update.facilities = facilities;
-    if (pricing !== undefined) update.pricing = pricing;
+    if (pricing !== undefined) {
+      if (pricing && pricing.serviceDailyRate !== undefined) {
+        const serviceRate = Number(pricing.serviceDailyRate);
+        if (!Number.isInteger(serviceRate) || serviceRate < 0 || serviceRate > 100000) {
+          return res.status(400).json({ success: false, message: 'Service provider per-day rate 0 se 100000 ke beech honi chahiye.' });
+        }
+        update.pricing = { ...pricing, serviceDailyRate: String(serviceRate) };
+      } else {
+        update.pricing = pricing;
+      }
+    }
     if (autoApproveFree !== undefined) update.autoApproveFree = autoApproveFree === true || autoApproveFree === 'true';
     if (contactRevealLimit !== undefined) {
       const limit = Number(contactRevealLimit);
@@ -221,26 +231,34 @@ router.post('/migrate-rooms', requireAdmin, async (req, res) => {
 router.get('/stats', requireAdmin, async (req, res) => {
   try {
     const rooms = await Room.find({})
-      .select('userId isApproved isPromoted promoPlan promoRequested paymentAmount bannerAmount isBannerActive createdAt')
+      .select('userId listingType isApproved isPromoted promoPlan promoRequested paymentAmount bannerAmount isBannerActive serviceExpiresAt createdAt')
       .lean();
     const acc = {
-      totalAds: rooms.length, liveAds: 0, pendingAds: 0, promoAds: 0, bannerActive: 0,
-      promoRevenue: 0, bannerRevenue: 0,
+      totalAds: rooms.length, liveAds: 0, pendingAds: 0, expiredAds: 0, promoAds: 0, bannerActive: 0,
+      promoRevenue: 0, serviceRevenue: 0, bannerRevenue: 0,
       byPlan: { regular: 0, promo7: 0, promo15: 0, promo30: 0 },
       userIds: new Set()
     };
+    const now = new Date();
     rooms.forEach((r) => {
-      if (r.isApproved) acc.liveAds++; else acc.pendingAds++;
+      const serviceExpired = r.listingType === 'service' && r.serviceExpiresAt && new Date(r.serviceExpiresAt) <= now;
+      if (r.isApproved && !serviceExpired) acc.liveAds++;
+      else if (!r.isApproved) acc.pendingAds++;
+      else acc.expiredAds++;
       if (r.isPromoted) acc.promoAds++;
       if (r.isBannerActive) acc.bannerActive++;
       const amt = Number(r.paymentAmount) || 0;
-      acc.promoRevenue += amt;
-      acc.bannerRevenue += Number(r.bannerAmount) || 0;
-      if (r.promoPlan && ['7', '15', '30'].includes(String(r.promoPlan))) {
-        acc.byPlan[`promo${r.promoPlan}`] += amt;
-      } else if (r.isApproved) {
-        acc.byPlan.regular += amt;
+      if (r.listingType === 'service') {
+        acc.serviceRevenue += amt;
+      } else {
+        acc.promoRevenue += amt;
+        if (r.promoPlan && ['7', '15', '30'].includes(String(r.promoPlan))) {
+          acc.byPlan[`promo${r.promoPlan}`] += amt;
+        } else if (r.isApproved) {
+          acc.byPlan.regular += amt;
+        }
       }
+      acc.bannerRevenue += Number(r.bannerAmount) || 0;
       if (mongoose.Types.ObjectId.isValid(r.userId)) acc.userIds.add(String(r.userId));
     });
     const registeredUsers = await User.countDocuments();
@@ -251,12 +269,14 @@ router.get('/stats', requireAdmin, async (req, res) => {
         totalAds: acc.totalAds,
         liveAds: acc.liveAds,
         pendingAds: acc.pendingAds,
+        expiredAds: acc.expiredAds,
         promoAds: acc.promoAds,
         bannerActive: acc.bannerActive,
         uniqueUsers: acc.userIds.size,
         promoRevenue: acc.promoRevenue,
+        serviceRevenue: acc.serviceRevenue,
         bannerRevenue: acc.bannerRevenue,
-        totalRevenue: acc.promoRevenue + acc.bannerRevenue,
+        totalRevenue: acc.promoRevenue + acc.serviceRevenue + acc.bannerRevenue,
         byPlan: acc.byPlan
       }
     });

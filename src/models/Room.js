@@ -44,6 +44,13 @@ const roomSchema = new mongoose.Schema({
   bannerRef: { type: String, default: '' },
   isBannerActive: { type: Boolean, default: false },
   bannerExpires: { type: Date, default: null },
+  // 🧾 SERVICE PROVIDER LISTING FEE (admin per-day rate × provider-chosen days)
+  // Rate snapshot at submit time; fee calculated server-side (client amount par bharosa nahi).
+  serviceDays: { type: Number, default: 0 },
+  serviceDailyRate: { type: Number, default: 0 },
+  serviceFee: { type: Number, default: 0 },
+  serviceStartsAt: { type: Date, default: null },
+  serviceExpiresAt: { type: Date, default: null },
   // P1-2 fix: report ke liye login zaroori — kis user (sha1 hash) ne report kiya
   // (public API me kabhi nahi jayegi)
   reportedBy: { type: [String], default: [], select: false },
@@ -71,5 +78,6 @@ roomSchema.index({ userId: 1, createdAt: -1 });                  // dashboard "m
 roomSchema.index({ isPromoted: 1, expiryDate: 1 });              // promo expiry cron (#22)
 roomSchema.index({ isBannerActive: 1, bannerExpires: 1 });       // banner strip + cron
 roomSchema.index({ listingType: 1, isApproved: 1, createdAt: -1 }); // service listings
+roomSchema.index({ listingType: 1, serviceExpiresAt: 1 });         // service duration expiry
 
 module.exports = mongoose.model('Room', roomSchema);
