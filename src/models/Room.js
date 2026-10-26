@@ -2,6 +2,8 @@ const mongoose = require('mongoose');
 
 const roomSchema = new mongoose.Schema({
   title: { type: String, required: true },
+  // 'room' = PG/Flat/Hostel/... | 'service' = Tiffin/Laundry/Tuition etc.
+  listingType: { type: String, enum: ['room', 'service'], default: 'room' },
   price: { type: String, required: true },
   type: { type: String, required: true }, 
   category: { type: String, required: true }, 
@@ -68,5 +70,6 @@ roomSchema.index({ isApproved: 1, isActive: 1, createdAt: -1 }); // public /room
 roomSchema.index({ userId: 1, createdAt: -1 });                  // dashboard "my rooms"
 roomSchema.index({ isPromoted: 1, expiryDate: 1 });              // promo expiry cron (#22)
 roomSchema.index({ isBannerActive: 1, bannerExpires: 1 });       // banner strip + cron
+roomSchema.index({ listingType: 1, isApproved: 1, createdAt: -1 }); // service listings
 
 module.exports = mongoose.model('Room', roomSchema);

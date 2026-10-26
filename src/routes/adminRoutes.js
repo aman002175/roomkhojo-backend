@@ -7,6 +7,10 @@ const Admin = require('../models/Admin');
 const Settings = require('../models/Settings');
 const User = require('../models/User');
 const Room = require('../models/Room');
+const Favorite = require('../models/Favorite');
+const ActionOtp = require('../models/ActionOtp');
+const SignupRequest = require('../models/SignupRequest');
+const ConsentLog = require('../models/ConsentLog');
 const { signAdmin, requireAdmin } = require('../middleware/auth');
 
 // Login par brute-force protection: 15 min me max 10 attempts (H4)
@@ -239,9 +243,11 @@ router.get('/stats', requireAdmin, async (req, res) => {
       }
       if (mongoose.Types.ObjectId.isValid(r.userId)) acc.userIds.add(String(r.userId));
     });
+    const registeredUsers = await User.countDocuments();
     res.json({
       success: true,
       stats: {
+        registeredUsers,
         totalAds: acc.totalAds,
         liveAds: acc.liveAds,
         pendingAds: acc.pendingAds,
@@ -257,6 +263,170 @@ router.get('/stats', requireAdmin, async (req, res) => {
   } catch (error) {
     console.error('Stats error:', error.message);
     res.status(500).json({ success: false, message: 'Stats load nahi hue. Baad me try karein.' });
+  }
+});
+
+// --- ADMIN: registered users list (search + pagination + listing count) ---
+router.get('/users', requireAdmin, async (req, res) => {
+  try {
+    const search = String(req.query.search || '').trim().slice(0, 80);
+    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const limit = Math.min(50, Math.max(1, parseInt(req.query.limit, 10) || 20));
+    const filter = {};
+    if (search) {
+      const safe = search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const rx = new RegExp(safe, 'i');
+      filter.$or = [{ name: rx }, { email: rx }, { phone: rx }];
+    }
+    const total = await User.countDocuments(filter);
+    const users = await User.find(filter)
+      .select('name email phone profilePic isGoogleUser status statusReason createdAt')
+      .sort({ createdAt: -1 })
+      .skip((page - 1) * limit)
+      .limit(limit)
+      .lean();
+    const ids = users.map((u) => String(u._id));
+    const counts = await Room.aggregate([
+      { $match: { userId: { $in: ids } } },
+      { $group: { _id: '$userId', count: { $sum: 1 } } }
+    ]);
+    const countMap = {};
+    counts.forEach((c) => { countMap[String(c._id)] = c.count; });
+    res.json({
+      success: true,
+      total,
+      page,
+      pages: Math.max(1, Math.ceil(total / limit)),
+      users: users.map((u) => ({
+        id: u._id,
+        name: u.name,
+        email: u.email,
+        phone: u.phone || '',
+        pic: u.profilePic || '',
+        isGoogleUser: Boolean(u.isGoogleUser),
+        status: u.status || 'active',
+        statusReason: u.statusReason || '',
+        createdAt: u.createdAt,
+        listingCount: countMap[String(u._id)] || 0
+      }))
+    });
+  } catch (error) {
+    console.error('Admin users error:', error.message);
+    res.status(500).json({ success: false, message: 'Users load nahi hue. Baad me try karein.' });
+  }
+});
+
+// --- ADMIN: ek user ki profile + uske saare listings ---
+router.get('/users/:id', requireAdmin, async (req, res) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) {
+      return res.status(404).json({ success: false, message: 'User nahi mila.' });
+    }
+    const user = await User.findById(req.params.id)
+      .select('name email phone profilePic isGoogleUser status statusReason statusChangedAt createdAt termsAcceptedAt termsVersion')
+      .lean();
+    if (!user) return res.status(404).json({ success: false, message: 'User nahi mila.' });
+    const rooms = await Room.find({ userId: req.params.id })
+      .select('title price type category listingType landmark mobile image images isApproved isActive isPromoted promoPlan createdAt')
+      .sort({ createdAt: -1 })
+      .limit(200)
+      .lean();
+    res.json({
+      success: true,
+      user: {
+        id: user._id,
+        name: user.name,
+        email: user.email,
+        phone: user.phone || '',
+        pic: user.profilePic || '',
+        isGoogleUser: Boolean(user.isGoogleUser),
+        status: user.status || 'active',
+        statusReason: user.statusReason || '',
+        statusChangedAt: user.statusChangedAt || null,
+        createdAt: user.createdAt,
+        termsAcceptedAt: user.termsAcceptedAt || null,
+        termsVersion: user.termsVersion || ''
+      },
+      rooms,
+      stats: {
+        total: rooms.length,
+        live: rooms.filter((r) => r.isApproved && r.isActive).length,
+        pending: rooms.filter((r) => !r.isApproved).length,
+        services: rooms.filter((r) => r.listingType === 'service').length
+      }
+    });
+  } catch (error) {
+    console.error('Admin user detail error:', error.message);
+    res.status(500).json({ success: false, message: 'User profile load nahi hui. Baad me try karein.' });
+  }
+});
+
+// --- ADMIN: suspend / ban / activate (purane tokens turant invalid) ---
+router.patch('/users/:id/status', requireAdmin, async (req, res) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) {
+      return res.status(404).json({ success: false, message: 'User nahi mila.' });
+    }
+    const status = String((req.body || {}).status || '').trim();
+    if (!['active', 'suspended', 'banned'].includes(status)) {
+      return res.status(400).json({ success: false, message: 'Status active, suspended ya banned hona chahiye.' });
+    }
+    const reason = String((req.body || {}).reason || '').trim().slice(0, 200);
+    const user = await User.findById(req.params.id);
+    if (!user) return res.status(404).json({ success: false, message: 'User nahi mila.' });
+    user.status = status;
+    user.statusReason = status === 'active' ? '' : reason;
+    user.statusChangedAt = new Date();
+    user.tokenVersion = (user.tokenVersion || 0) + 1;
+    await user.save();
+    const messages = {
+      active: 'User account dobara activate ho gaya.',
+      suspended: 'User account suspend ho gaya.',
+      banned: 'User account ban ho gaya.'
+    };
+    res.json({ success: true, message: messages[status], user: { id: user._id, status: user.status, statusReason: user.statusReason } });
+  } catch (error) {
+    console.error('Admin user status error:', error.message);
+    res.status(500).json({ success: false, message: 'Status update nahi hua. Baad me try karein.' });
+  }
+});
+
+// --- ADMIN: user delete (account + ads + favorites cleanup) ---
+router.delete('/users/:id', requireAdmin, async (req, res) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) {
+      return res.status(404).json({ success: false, message: 'User nahi mila.' });
+    }
+    if (String((req.body || {}).confirm || '') !== 'DELETE') {
+      return res.status(400).json({ success: false, message: 'Confirm ke liye DELETE bhejein.' });
+    }
+    const user = await User.findById(req.params.id);
+    if (!user) return res.status(404).json({ success: false, message: 'User nahi mila.' });
+    const rooms = await Room.find({ userId: user._id }).select('image images').lean();
+    const urls = [];
+    rooms.forEach((r) => {
+      if (r.image && /^https?:\/\//.test(r.image)) urls.push(r.image);
+      (r.images || []).forEach((u) => { if (u && /^https?:\/\//.test(u)) urls.push(u); });
+    });
+    await Promise.all([
+      Room.deleteMany({ userId: user._id }),
+      Favorite.deleteMany({ userId: user._id }),
+      ActionOtp.deleteMany({ userId: user._id }),
+      SignupRequest.deleteOne({ email: String(user.email).toLowerCase().trim() }),
+      ConsentLog.updateMany(
+        { emailHash: require('crypto').createHash('sha256').update(String(user.email).toLowerCase().trim()).digest('hex'), withdrawnAt: null },
+        { $set: { withdrawnAt: new Date() } }
+      ),
+      User.deleteOne({ _id: user._id })
+    ]);
+    try {
+      const upload = require('../config/cloudinary');
+      if (urls.length > 0) await upload.destroyByUrls(urls);
+    } catch { /* images orphan maaf — account delete ho chuka */ }
+    res.json({ success: true, message: `${user.name} ka account aur ${rooms.length} listings delete ho gaye.` });
+  } catch (error) {
+    console.error('Admin user delete error:', error.message);
+    res.status(500).json({ success: false, message: 'User delete nahi hua. Baad me try karein.' });
   }
 });
 

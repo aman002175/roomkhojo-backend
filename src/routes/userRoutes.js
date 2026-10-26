@@ -8,9 +8,11 @@ const Otp = require('../models/Otp');
 const Room = require('../models/Room');
 const Favorite = require('../models/Favorite');
 const ConsentLog = require('../models/ConsentLog');
+const SignupRequest = require('../models/SignupRequest');
+const ActionOtp = require('../models/ActionOtp');
 const mongoose = require('mongoose');
 const { signUser, requireAuth, requireAdmin } = require('../middleware/auth');
-const { sendOtpEmail } = require('../config/mailer');
+const { sendOtpEmail, sendOtpEmailFor } = require('../config/mailer');
 
 // Brute-force protection (H4): login/google par 15 min me max 20,
 // OTP maangne par 15 min me max 10 (plus per-email 3/15min andar)
@@ -40,7 +42,23 @@ const otpVerifyLimiter = createLimiter('otp-verify', {
 });
 
 const sha256 = (val) => crypto.createHash('sha256').update(val).digest('hex');
-const publicUser = (user) => ({ id: user._id, name: user.name, email: user.email, pic: user.profilePic });
+const publicUser = (user) => ({ id: user._id, name: user.name, email: user.email, phone: user.phone || '', pic: user.profilePic });
+// Indian mobile: 10 digits, 6-9 se shuru (91 prefix accept)
+const cleanPhone = (raw) => {
+  const digits = String(raw || '').replace(/\D/g, '');
+  const normalized = digits.length === 12 && digits.startsWith('91') ? digits.slice(2) : digits;
+  return /^[6-9]\d{9}$/.test(normalized) ? normalized : null;
+};
+const accountBlockMessage = (user) => user && user.status === 'banned'
+  ? 'Ye account permanently ban hai. Support se sampark karein.'
+  : user && user.status === 'suspended'
+    ? 'Ye account suspend hai. Support se sampark karein.'
+    : '';
+const maskEmail = (email) => {
+  const [name, domain] = String(email || '').split('@');
+  if (!name || !domain) return '';
+  return `${name.slice(0, 2)}${'•'.repeat(Math.max(2, Math.min(6, name.length - 2)))}@${domain}`;
+};
 // Basic email-format check (nodemailer addressparser abuse + galat input rokne ke liye)
 const isValidEmail = (email) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(email || '').trim());
 // Legal documents ka current version — consent proof ke liye user par save hota hai
@@ -59,35 +77,121 @@ const isWeakPassword = (pw) => {
   return false;
 };
 
-// 1. Email & Password Signup (bcrypt hash + JWT — C4/C7 fix)
-router.post('/signup', authLimiter, async (req, res) => {
+// 1. Signup step-1: email OTP bhejo (account ab OTP verify hone par hi banta hai)
+// Password is request me validate hota hai par store NAHI hota — verify par dobara aata hai.
+router.post('/signup/request-otp', otpRequestLimiter, async (req, res) => {
   try {
-    const { name, email, password } = req.body || {};
-    if (!name || !email || !password) {
-      return res.status(400).json({ success: false, message: 'Naam, Email aur Password teeno zaroori hain.' });
+    const { name, phone, email, password } = req.body || {};
+    if (!name || !phone || !email || !password) {
+      return res.status(400).json({ success: false, message: 'Naam, Mobile, Email aur Password charo zaroori hain.' });
     }
     if (!isValidEmail(email)) {
       return res.status(400).json({ success: false, message: 'Sahi email address daliye.' });
     }
-    if (password.length < 8) {
+    const cleanName = String(name).trim();
+    if (cleanName.length < 2 || cleanName.length > 60) {
+      return res.status(400).json({ success: false, message: 'Naam 2-60 characters ka ho.' });
+    }
+    const cleanNumber = cleanPhone(phone);
+    if (!cleanNumber) {
+      return res.status(400).json({ success: false, message: 'Sahi 10-digit mobile number daliye.' });
+    }
+    if (String(password).length < 8) {
       return res.status(400).json({ success: false, message: 'Password kam se kam 8 characters ka ho.' });
     }
     if (isWeakPassword(password)) {
       return res.status(400).json({ success: false, message: 'Ye password bahut common hai. Strong password chunein.' });
     }
-    const existingUser = await User.findOne({ email: email.toLowerCase().trim() });
-    if (existingUser) {
-      return res.status(400).json({ success: false, message: 'Ye Email pehle se registered hai!' });
+    const cleanEmail = String(email).toLowerCase().trim();
+    if (await User.findOne({ email: cleanEmail })) {
+      return res.status(409).json({ success: false, message: 'Ye Email pehle se registered hai. Sign in karein.' });
     }
-    const newUser = await User.create({ name, email, password, termsAcceptedAt: new Date(), termsVersion: TERMS_VERSION }); // Model hook hash karega
-    // 🧾 Consent proof (hashed) — account delete ke baad bhi 180 din tak retention
-    ConsentLog.create({ emailHash: sha256(email.toLowerCase().trim()), termsVersion: TERMS_VERSION }).catch(() => {});
-    const token = signUser(newUser);
-    res.status(201).json({ success: true, message: 'Account ban gaya!', token, user: publicUser(newUser) });
+
+    const now = new Date();
+    const record = await SignupRequest.findOne({ email: cleanEmail });
+    const inWindow = record && record.sendWindowStart && (now - record.sendWindowStart) < 15 * 60 * 1000;
+    if (inWindow && (record.sendCount || 0) >= 3) {
+      return res.status(429).json({ success: false, message: 'Bahut zyada OTP requests. 15 minute baad try karein.' });
+    }
+    const otp = String(crypto.randomInt(100000, 999999));
+    await SignupRequest.findOneAndUpdate(
+      { email: cleanEmail },
+      {
+        name: cleanName,
+        phone: cleanNumber,
+        otpHash: sha256(otp),
+        otpExpires: new Date(Date.now() + 10 * 60 * 1000),
+        attempts: 0,
+        lastSentAt: now,
+        sendCount: inWindow ? (record.sendCount || 0) + 1 : 1,
+        sendWindowStart: inWindow ? record.sendWindowStart : now
+      },
+      { upsert: true, new: true }
+    );
+    try {
+      await sendOtpEmailFor(cleanEmail, otp, 'signup');
+    } catch (mailErr) {
+      if (mailErr.code === 'EMAIL_NOT_CONFIGURED') {
+        return res.status(503).json({ success: false, message: 'Email service abhi setup nahi hai. Admin se sampark karein.' });
+      }
+      console.error('Signup OTP mail failed:', mailErr.message);
+      return res.status(502).json({ success: false, message: 'OTP email bhejne me dikkat aayi. Thodi der baad try karein.' });
+    }
+    res.json({ success: true, message: 'OTP aapke email par bhej diya gaya hai.', email: cleanEmail, maskedEmail: maskEmail(cleanEmail) });
   } catch (error) {
-    console.error('Signup error:', error.message);
+    console.error('Signup OTP error:', error.message);
     res.status(500).json({ success: false, message: 'Server me gadbad hai. Baad me try karein.' });
   }
+});
+
+// 1b. Signup step-2: OTP verify → account create + login token
+router.post('/signup/verify-otp', otpVerifyLimiter, async (req, res) => {
+  try {
+    const { email, otp, password } = req.body || {};
+    if (!email || !otp || !password) {
+      return res.status(400).json({ success: false, message: 'Email, OTP aur Password zaroori hain.' });
+    }
+    if (String(password).length < 8 || isWeakPassword(password)) {
+      return res.status(400).json({ success: false, message: 'Password strong (8+ characters) hona chahiye.' });
+    }
+    const cleanEmail = String(email).toLowerCase().trim();
+    const record = await SignupRequest.findOne({ email: cleanEmail });
+    if (!record || !record.otpHash || !record.otpExpires || record.otpExpires < new Date()) {
+      return res.status(400).json({ success: false, message: 'OTP galat ya expire ho gaya hai. Naya OTP bhejein.' });
+    }
+    if ((record.attempts || 0) >= 5) {
+      return res.status(429).json({ success: false, message: 'Bahut zyada galat attempts. Naya OTP bhejein.' });
+    }
+    if (sha256(String(otp).trim()) !== record.otpHash) {
+      record.attempts = (record.attempts || 0) + 1;
+      await record.save();
+      return res.status(400).json({ success: false, message: 'OTP galat hai.' });
+    }
+    if (await User.findOne({ email: cleanEmail })) {
+      await SignupRequest.deleteOne({ email: cleanEmail });
+      return res.status(409).json({ success: false, message: 'Ye Email pehle se registered hai. Sign in karein.' });
+    }
+    const newUser = await User.create({
+      name: record.name,
+      email: cleanEmail,
+      phone: record.phone,
+      password,
+      termsAcceptedAt: new Date(),
+      termsVersion: TERMS_VERSION
+    });
+    ConsentLog.create({ emailHash: sha256(cleanEmail), termsVersion: TERMS_VERSION }).catch(() => {});
+    await SignupRequest.deleteOne({ email: cleanEmail });
+    const token = signUser(newUser);
+    res.status(201).json({ success: true, message: 'Email verify ho gaya — account ban gaya!', token, user: publicUser(newUser) });
+  } catch (error) {
+    console.error('Signup verify error:', error.message);
+    res.status(500).json({ success: false, message: 'Server me gadbad hai. Baad me try karein.' });
+  }
+});
+
+// Purana direct-signup route band: OTP ke bina account nahi banega.
+router.post('/signup', authLimiter, (req, res) => {
+  res.status(410).json({ success: false, message: 'App update karein — ab signup email OTP verify karne ke baad hota hai.' });
 });
 
 // 2. Email & Password Login (bcrypt compare + JWT — C4/C7 fix)
@@ -103,6 +207,8 @@ router.post('/login', authLimiter, async (req, res) => {
       console.warn('Login 401: userExists=', Boolean(user));
       return res.status(401).json({ success: false, message: 'Email ya Password galat hai!' });
     }
+    const blockedMsg = accountBlockMessage(user);
+    if (blockedMsg) return res.status(403).json({ success: false, message: blockedMsg });
     // Login par checkbox tick tha → consent proof update (acceptedTerms FE bhejta hai)
     if (req.body && req.body.acceptedTerms === true) {
       if (user.termsVersion !== TERMS_VERSION) {
@@ -151,7 +257,11 @@ router.post('/google', authLimiter, async (req, res) => {
         termsVersion: TERMS_VERSION
       });
       ConsentLog.create({ emailHash: sha256(payload.email.toLowerCase()), termsVersion: TERMS_VERSION }).catch(() => {});
-    } else if (req.body && req.body.acceptedTerms === true) {
+    } else {
+      const blockedMsg = accountBlockMessage(user);
+      if (blockedMsg) return res.status(403).json({ success: false, message: blockedMsg });
+    }
+    if (user && req.body && req.body.acceptedTerms === true) {
       // Existing user: checkbox tick tha → consent proof refresh
       if (user.termsVersion !== TERMS_VERSION) {
         ConsentLog.create({ emailHash: sha256(user.email.toLowerCase()), termsVersion: TERMS_VERSION }).catch(() => {});
@@ -320,8 +430,8 @@ router.post('/change-password', requireAuth, async (req, res) => {
   }
 });
 
-// P2 #48: Email change — password confirm + duplicate check (Google-only account me password nahi hota)
-router.post('/change-email', authLimiter, requireAuth, async (req, res) => {
+// P2 #48 + #6: Email change — nayi email par OTP verify hone ke baad hi update
+router.post('/change-email/request-otp', otpRequestLimiter, requireAuth, async (req, res) => {
   try {
     const { password, newEmail } = req.body || {};
     if (!isValidEmail(newEmail)) {
@@ -330,8 +440,8 @@ router.post('/change-email', authLimiter, requireAuth, async (req, res) => {
     const cleanEmail = String(newEmail).toLowerCase().trim();
     const user = await User.findById(req.user.id);
     if (!user) return res.status(404).json({ success: false, message: 'Account nahi mila.' });
-    if (!user.password) {
-      return res.status(400).json({ success: false, message: 'Google se bane account ka email yahan se change nahi hota.' });
+    if (!user.password || user.isGoogleUser) {
+      return res.status(400).json({ success: false, message: 'Google account ka email Google se manage hota hai.' });
     }
     if (cleanEmail === user.email) {
       return res.status(400).json({ success: false, message: 'Ye wahi purana email hai.' });
@@ -339,31 +449,155 @@ router.post('/change-email', authLimiter, requireAuth, async (req, res) => {
     if (!password || !(await user.comparePassword(password))) {
       return res.status(401).json({ success: false, message: 'Password galat hai!' });
     }
-    const taken = await User.findOne({ email: cleanEmail });
-    if (taken) {
+    if (await User.findOne({ email: cleanEmail })) {
       return res.status(409).json({ success: false, message: 'Ye email kisi aur account par pehle se hai.' });
     }
-    user.email = cleanEmail;
-    await user.save();
-    res.json({ success: true, message: 'Email update ho gaya!', user: publicUser(user) });
+
+    const now = new Date();
+    const record = await ActionOtp.findOne({ userId: user._id, purpose: 'email-change' });
+    const inWindow = record && record.sendWindowStart && (now - record.sendWindowStart) < 15 * 60 * 1000;
+    if (inWindow && (record.sendCount || 0) >= 3) {
+      return res.status(429).json({ success: false, message: 'Bahut zyada OTP requests. 15 minute baad try karein.' });
+    }
+    const otp = String(crypto.randomInt(100000, 999999));
+    await ActionOtp.findOneAndUpdate(
+      { userId: user._id, purpose: 'email-change' },
+      {
+        newEmail: cleanEmail,
+        otpHash: sha256(otp),
+        otpExpires: new Date(Date.now() + 10 * 60 * 1000),
+        attempts: 0,
+        lastSentAt: now,
+        sendCount: inWindow ? (record.sendCount || 0) + 1 : 1,
+        sendWindowStart: inWindow ? record.sendWindowStart : now
+      },
+      { upsert: true, new: true }
+    );
+    try {
+      await sendOtpEmailFor(cleanEmail, otp, 'email-change');
+    } catch (mailErr) {
+      if (mailErr.code === 'EMAIL_NOT_CONFIGURED') {
+        return res.status(503).json({ success: false, message: 'Email service abhi setup nahi hai. Admin se sampark karein.' });
+      }
+      console.error('Email-change OTP mail failed:', mailErr.message);
+      return res.status(502).json({ success: false, message: 'OTP email bhejne me dikkat aayi. Thodi der baad try karein.' });
+    }
+    res.json({ success: true, message: `OTP ${maskEmail(cleanEmail)} par bhej diya gaya hai.`, maskedEmail: maskEmail(cleanEmail) });
   } catch (error) {
-    console.error('Change-email error:', error.message);
+    console.error('Change-email OTP error:', error.message);
     res.status(500).json({ success: false, message: 'Server me gadbad hai. Baad me try karein.' });
   }
 });
 
-// P2 #48: Account delete — "DELETE" confirm + (password agar hai) + rooms/favorites cleanup;
-// Cloudinary images best-effort destroy (bounded) — fail ho toh delete rukna nahi chahiye.
-router.post('/delete-account', authLimiter, requireAuth, async (req, res) => {
+router.post('/change-email/verify', otpVerifyLimiter, requireAuth, async (req, res) => {
   try {
-    const { password, confirm } = req.body || {};
+    const { newEmail, otp } = req.body || {};
+    if (!isValidEmail(newEmail) || !otp) {
+      return res.status(400).json({ success: false, message: 'Naya email aur OTP dono zaroori hain.' });
+    }
+    const cleanEmail = String(newEmail).toLowerCase().trim();
+    const user = await User.findById(req.user.id);
+    if (!user) return res.status(404).json({ success: false, message: 'Account nahi mila.' });
+    if (!user.password || user.isGoogleUser) {
+      return res.status(400).json({ success: false, message: 'Google account ka email Google se manage hota hai.' });
+    }
+    const record = await ActionOtp.findOne({ userId: user._id, purpose: 'email-change' });
+    if (!record || record.newEmail !== cleanEmail || !record.otpHash || !record.otpExpires || record.otpExpires < new Date()) {
+      return res.status(400).json({ success: false, message: 'OTP galat ya expire ho gaya hai. Naya OTP bhejein.' });
+    }
+    if ((record.attempts || 0) >= 5) {
+      return res.status(429).json({ success: false, message: 'Bahut zyada galat attempts. Naya OTP bhejein.' });
+    }
+    if (sha256(String(otp).trim()) !== record.otpHash) {
+      record.attempts = (record.attempts || 0) + 1;
+      await record.save();
+      return res.status(400).json({ success: false, message: 'OTP galat hai.' });
+    }
+    if (await User.findOne({ email: cleanEmail })) {
+      return res.status(409).json({ success: false, message: 'Ye email kisi aur account par pehle se hai.' });
+    }
+    user.email = cleanEmail;
+    user.tokenVersion = (user.tokenVersion || 0) + 1;
+    await user.save();
+    await ActionOtp.deleteOne({ userId: user._id, purpose: 'email-change' });
+    const token = signUser(user);
+    res.json({ success: true, message: 'Email verify ho gaya aur update ho gaya!', token, user: publicUser(user) });
+  } catch (error) {
+    console.error('Change-email verify error:', error.message);
+    res.status(500).json({ success: false, message: 'Server me gadbad hai. Baad me try karein.' });
+  }
+});
+
+// Purana direct-change route band (OTP bypass nahi).
+router.post('/change-email', authLimiter, requireAuth, (req, res) => {
+  res.status(410).json({ success: false, message: 'App update karein — email change ab OTP verify karne ke baad hota hai.' });
+});
+
+// #6: Account delete step-1 — current email par OTP
+router.post('/delete-account/request-otp', otpRequestLimiter, requireAuth, async (req, res) => {
+  try {
+    const user = await User.findById(req.user.id);
+    if (!user) return res.status(404).json({ success: false, message: 'Account nahi mila.' });
+    const now = new Date();
+    const record = await ActionOtp.findOne({ userId: user._id, purpose: 'delete-account' });
+    const inWindow = record && record.sendWindowStart && (now - record.sendWindowStart) < 15 * 60 * 1000;
+    if (inWindow && (record.sendCount || 0) >= 3) {
+      return res.status(429).json({ success: false, message: 'Bahut zyada OTP requests. 15 minute baad try karein.' });
+    }
+    const otp = String(crypto.randomInt(100000, 999999));
+    await ActionOtp.findOneAndUpdate(
+      { userId: user._id, purpose: 'delete-account' },
+      {
+        newEmail: '',
+        otpHash: sha256(otp),
+        otpExpires: new Date(Date.now() + 10 * 60 * 1000),
+        attempts: 0,
+        lastSentAt: now,
+        sendCount: inWindow ? (record.sendCount || 0) + 1 : 1,
+        sendWindowStart: inWindow ? record.sendWindowStart : now
+      },
+      { upsert: true, new: true }
+    );
+    try {
+      await sendOtpEmailFor(user.email, otp, 'delete-account');
+    } catch (mailErr) {
+      if (mailErr.code === 'EMAIL_NOT_CONFIGURED') {
+        return res.status(503).json({ success: false, message: 'Email service abhi setup nahi hai. Admin se sampark karein.' });
+      }
+      console.error('Delete-account OTP mail failed:', mailErr.message);
+      return res.status(502).json({ success: false, message: 'OTP email bhejne me dikkat aayi. Thodi der baad try karein.' });
+    }
+    res.json({ success: true, message: `OTP ${maskEmail(user.email)} par bhej diya gaya hai.`, maskedEmail: maskEmail(user.email) });
+  } catch (error) {
+    console.error('Delete-account OTP error:', error.message);
+    res.status(500).json({ success: false, message: 'Server me gadbad hai. Baad me try karein.' });
+  }
+});
+
+// #6: Account delete step-2 — DELETE confirm + current email ka OTP verify
+// Cloudinary images best-effort destroy (bounded) — fail ho toh delete rukna nahi chahiye.
+router.post('/delete-account', otpVerifyLimiter, requireAuth, async (req, res) => {
+  try {
+    const { otp, confirm } = req.body || {};
     if (confirm !== 'DELETE') {
       return res.status(400).json({ success: false, message: 'Confirm ke liye DELETE likhein.' });
     }
+    if (!otp) {
+      return res.status(400).json({ success: false, message: 'Pehle email par OTP bhejein, phir OTP dalein.' });
+    }
     const user = await User.findById(req.user.id);
     if (!user) return res.status(404).json({ success: false, message: 'Account nahi mila.' });
-    if (user.password && (!password || !(await user.comparePassword(password)))) {
-      return res.status(401).json({ success: false, message: 'Password galat hai!' });
+    const record = await ActionOtp.findOne({ userId: user._id, purpose: 'delete-account' });
+    if (!record || !record.otpHash || !record.otpExpires || record.otpExpires < new Date()) {
+      return res.status(400).json({ success: false, message: 'OTP galat ya expire ho gaya hai. Naya OTP bhejein.' });
+    }
+    if ((record.attempts || 0) >= 5) {
+      return res.status(429).json({ success: false, message: 'Bahut zyada galat attempts. Naya OTP bhejein.' });
+    }
+    if (sha256(String(otp).trim()) !== record.otpHash) {
+      record.attempts = (record.attempts || 0) + 1;
+      await record.save();
+      return res.status(400).json({ success: false, message: 'OTP galat hai.' });
     }
     // Delete se pehle image URLs jama karo (baad me docs gayab ho jayenge)
     const rooms = await Room.find({ userId: user._id }).select('image images').lean();
@@ -375,6 +609,8 @@ router.post('/delete-account', authLimiter, requireAuth, async (req, res) => {
     await Promise.all([
       Room.deleteMany({ userId: user._id }),
       Favorite.deleteMany({ userId: user._id }),
+      ActionOtp.deleteMany({ userId: user._id }),
+      SignupRequest.deleteOne({ email: String(user.email).toLowerCase().trim() }),
       User.deleteOne({ _id: user._id })
     ]);
     // 🧾 Consent withdrawal ka proof (hashed) — 180 din baad cleanup cron delete karega
@@ -402,15 +638,32 @@ router.post('/delete-account', authLimiter, requireAuth, async (req, res) => {
 // 9. Apna naam badlo (logged-in user — settings panel se)
 router.patch('/profile', requireAuth, async (req, res) => {
   try {
-    const clean = String((req.body || {}).name || '').trim();
-    if (clean.length < 2 || clean.length > 60) {
-      return res.status(400).json({ success: false, message: 'Naam 2-60 characters ka ho.' });
+    const body = req.body || {};
+    const hasName = body.name !== undefined;
+    const hasPhone = body.phone !== undefined;
+    if (!hasName && !hasPhone) {
+      return res.status(400).json({ success: false, message: 'Naam ya mobile me se kuch update karein.' });
+    }
+    let cleanName = '';
+    if (hasName) {
+      cleanName = String(body.name || '').trim();
+      if (cleanName.length < 2 || cleanName.length > 60) {
+        return res.status(400).json({ success: false, message: 'Naam 2-60 characters ka ho.' });
+      }
+    }
+    let cleanNumber = '';
+    if (hasPhone) {
+      cleanNumber = cleanPhone(body.phone);
+      if (!cleanNumber) {
+        return res.status(400).json({ success: false, message: 'Sahi 10-digit mobile number daliye.' });
+      }
     }
     const user = await User.findById(req.user.id);
     if (!user) return res.status(404).json({ success: false, message: 'Account nahi mila.' });
-    user.name = clean;
+    if (hasName) user.name = cleanName;
+    if (hasPhone) user.phone = cleanNumber;
     await user.save();
-    res.json({ success: true, message: 'Naam update ho gaya!', user: publicUser(user) });
+    res.json({ success: true, message: 'Profile update ho gayi!', user: publicUser(user) });
   } catch (error) {
     console.error('Profile error:', error.message);
     res.status(500).json({ success: false, message: 'Server me gadbad hai. Baad me try karein.' });

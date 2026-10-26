@@ -52,6 +52,12 @@ const requireAuth = async (req, res, next) => {
     if ((user.tokenVersion || 0) !== (decoded.tv || 0)) {
       return res.status(401).json({ success: false, message: 'Session expire ho gaya. Dobara login karein.' });
     }
+    if (user.status === 'suspended' || user.status === 'banned') {
+      const msg = user.status === 'banned'
+        ? 'Account permanently ban hai. Support se sampark karein.'
+        : 'Account suspend hai. Support se sampark karein.';
+      return res.status(403).json({ success: false, message: msg });
+    }
     req.user = { id: user._id.toString(), email: user.email, role: user.role };
     next();
   } catch (err) {

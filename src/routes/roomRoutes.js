@@ -209,12 +209,16 @@ router.post('/', requireAuth, upload.array('images', 6), async (req, res) => {
         return res.status(429).json({ success: false, message: 'Ek din me max 10 ads post kar sakte ho. 24 ghante baad dobara try karo.' });
       }
     }
-    const { title, price, type, category, landmark, mobile, description, lng, lat, promoPlan, paymentRef, paymentCode, bannerRequested, bannerRef, landmarks, googleMapUrl } = req.body || {};
-
-    if (!title || !price || !type || !category) {
-      return res.status(400).json({ success: false, message: 'Title, Price, Type aur Category zaroori hain.' });
+    const { title, price, type, category, landmark, mobile, description, lng, lat, promoPlan, paymentRef, paymentCode, bannerRequested, bannerRef, landmarks, googleMapUrl, listingType } = req.body || {};
+    const isService = listingType === 'service';
+    if (!title || !price || !category || (!isService && !type)) {
+      return res.status(400).json({ success: false, message: isService ? 'Service ka naam, Price aur Category zaroori hain.' : 'Title, Price, Type aur Category zaroori hain.' });
     }
-    const cleanAudience = cleanType(type);
+    const cleanCategory = String(category).trim().slice(0, 60);
+    if (cleanCategory.length < 2) {
+      return res.status(400).json({ success: false, message: 'Sahi category chunein.' });
+    }
+    const cleanAudience = isService ? 'Service' : cleanType(type);
     if (!cleanAudience) {
       return res.status(400).json({ success: false, message: 'Audience (Boys/Girls/Family/Anyone) sahi chuno.' });
     }
@@ -264,10 +268,11 @@ router.post('/', requireAuth, upload.array('images', 6), async (req, res) => {
     }
 
     const newRoom = new Room({
-      title: String(title).trim(),
+      title: String(title).trim().slice(0, 120),
+      listingType: isService ? 'service' : 'room',
       price: cleanPriceVal,
       type: cleanAudience,
-      category: String(category).trim(),
+      category: cleanCategory,
       landmark: String(landmark || '').trim(),
       mobile: cleanPhone,
       description: String(description || '').trim(),
@@ -332,11 +337,14 @@ router.get('/', async (req, res) => {
 router.get('/banners', async (req, res) => {
   try {
     const now = new Date();
+    // Paid banners + approved service providers (tiffin/laundry etc.) dono top strip me.
     const rooms = await Room.find({
       isApproved: true,
       isActive: true,
-      isBannerActive: true,
-      $or: [{ bannerExpires: null }, { bannerExpires: { $gte: now } }]
+      $or: [
+        { isBannerActive: true, $or: [{ bannerExpires: null }, { bannerExpires: { $gte: now } }] },
+        { listingType: 'service' }
+      ]
     }).select('-reportedBy -userId -paymentRef -paymentCode -bannerRef -viewKeys -mobile').sort({ createdAt: -1 }).limit(50).lean(); // P1 #19 (top strip chhota hota hai)
     res.json({ success: true, count: rooms.length, rooms });
   } catch (error) { serverError(res, error, 'Banners error'); }

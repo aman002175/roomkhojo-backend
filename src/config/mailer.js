@@ -23,9 +23,28 @@ const getTransporter = () => {
   return transporter;
 };
 
-// Password-reset OTP email. SMTP configure na ho toh EMAIL_NOT_CONFIGURED
+const PURPOSES = {
+  reset: {
+    subject: 'RoomKhojo — Password Reset OTP',
+    line: 'password-reset'
+  },
+  signup: {
+    subject: 'RoomKhojo — Email Verification OTP',
+    line: 'signup email-verification'
+  },
+  'email-change': {
+    subject: 'RoomKhojo — New Email Verification OTP',
+    line: 'new email verification'
+  },
+  'delete-account': {
+    subject: 'RoomKhojo — Account Delete Confirmation OTP',
+    line: 'account-delete confirmation'
+  }
+};
+
+// Purpose-based OTP email. SMTP configure na ho toh EMAIL_NOT_CONFIGURED
 // throw karta hai (caller 503 dega). Production me OTP kabhi log nahi hota.
-const sendOtpEmail = async (to, otp) => {
+const sendOtpEmailFor = async (to, otp, purpose = 'reset') => {
   const tx = getTransporter();
   if (!tx) {
     if (process.env.NODE_ENV !== 'production') {
@@ -35,12 +54,15 @@ const sendOtpEmail = async (to, otp) => {
     err.code = 'EMAIL_NOT_CONFIGURED';
     throw err;
   }
+  const meta = PURPOSES[purpose] || PURPOSES.reset;
   await tx.sendMail({
     from: process.env.SMTP_FROM || process.env.SMTP_USER,
     to,
-    subject: 'RoomKhojo — Password Reset OTP',
-    text: `Aapka RoomKhojo password-reset OTP hai: ${otp}\nYe OTP 10 minute me expire ho jayega. Kisi ke saath share na karein.\nAgar aapne ye request nahi ki thi toh ignore kar dein.`
+    subject: meta.subject,
+    text: `Aapka RoomKhojo ${meta.line} OTP hai: ${otp}\nYe OTP 10 minute me expire ho jayega. Kisi ke saath share na karein.\nAgar aapne ye request nahi ki thi toh ignore kar dein.`
   });
 };
 
-module.exports = { sendOtpEmail };
+const sendOtpEmail = (to, otp) => sendOtpEmailFor(to, otp, 'reset');
+
+module.exports = { sendOtpEmail, sendOtpEmailFor };

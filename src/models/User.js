@@ -4,11 +4,17 @@ const bcrypt = require('bcryptjs');
 const userSchema = new mongoose.Schema({
   name: { type: String, required: true },
   email: { type: String, required: true, unique: true, lowercase: true, trim: true },
+  // Verified mobile (signup/ profile) — listing form me prefill hota hai
+  phone: { type: String, trim: true, default: '' },
 
   // Google users ke liye password optional hai
   password: { type: String },
 
   role: { type: String, enum: ['user', 'admin'], default: 'user' },
+  // Admin moderation: suspended/banned users login aur token access dono se blocked
+  status: { type: String, enum: ['active', 'suspended', 'banned'], default: 'active' },
+  statusReason: { type: String, default: '' },
+  statusChangedAt: { type: Date, default: null },
   profilePic: { type: String, default: '' },
   isGoogleUser: { type: Boolean, default: false }, // Pehchanne ke liye
 
