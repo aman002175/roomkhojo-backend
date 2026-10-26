@@ -460,13 +460,14 @@ router.put('/:id/edit', requireAuth, upload.array('images', 6), async (req, res)
       return res.status(403).json({ success: false, message: 'Access Denied! Ye ad aapka nahi hai.' });
     }
 
-    if (req.body.title) room.title = String(req.body.title).trim();
+    const isServiceListing = room.listingType === 'service';
+    if (req.body.title) room.title = String(req.body.title).trim().slice(0, 120);
     if (req.body.price) {
       const cleanPriceVal = cleanPrice(req.body.price); // P1 #24
       if (!cleanPriceVal) return res.status(400).json({ success: false, message: 'Price sirf number hona chahiye (jaise 3000).' });
       room.price = cleanPriceVal;
     }
-    if (req.body.type) {
+    if (req.body.type && !isServiceListing) {
       const cleanAudience = cleanType(req.body.type);
       if (!cleanAudience) return res.status(400).json({ success: false, message: 'Audience (Boys/Girls/Family/Anyone) sahi chuno.' });
       room.type = cleanAudience;
@@ -578,7 +579,7 @@ router.patch('/:id/approve', requireAdmin, async (req, res) => {
     }
 
     await room.save();
-    res.status(200).json({ success: true, message: 'Room Approved!', room });
+    res.status(200).json({ success: true, message: room.listingType === 'service' ? 'Service listing approved!' : 'Room Approved!', room });
   } catch (error) { serverError(res, error, 'Approve error'); }
 });
 
