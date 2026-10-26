@@ -47,7 +47,8 @@ const PURPOSES = {
 const sendOtpEmailFor = async (to, otp, purpose = 'reset') => {
   const tx = getTransporter();
   if (!tx) {
-    if (process.env.NODE_ENV !== 'production') {
+    const isProd = process.env.NODE_ENV === 'production' || Boolean(process.env.VERCEL);
+    if (!isProd) {
       console.log(`📧 [DEV-ONLY] OTP for ${to}: ${otp}`);
     }
     const err = new Error('EMAIL_NOT_CONFIGURED');

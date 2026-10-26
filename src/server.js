@@ -5,10 +5,13 @@ const helmet = require('helmet');
 const morgan = require('morgan');
 const { createLimiter } = require('./utils/rateStore'); // Upstash-ready (env na ho toh MemoryStore)
 const mongoSanitize = require('express-mongo-sanitize');
+const { sanitizeDeep, escapeHtml } = require('./utils/security');
 
 const connectDB = require('./config/db'); 
 
 const app = express();
+
+app.disable('x-powered-by');
 
 // Vercel/Render proxy ke peeche sahi client-IP ke liye (M13 fix).
 // Iske bina rate-limit galat IP par lagta hai.
@@ -32,79 +35,81 @@ app.use((req, res, next) => {
 // ==========================================
 
 // 1. HELMET: HTTP headers secure karta hai
-app.use(helmet()); 
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'none'"],
+      baseUri: ["'none'"],
+      frameAncestors: ["'none'"],
+      formAction: ["'none'"]
+    }
+  },
+  crossOriginEmbedderPolicy: false,
+  referrerPolicy: { policy: 'no-referrer' },
+  strictTransportSecurity: { maxAge: 15552000, includeSubDomains: true }
+}));
+app.use((req, res, next) => {
+  res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+  res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
+  next();
+});
 
 // 2. CORS: Sirf allowed frontend se requests accept karega
 const allowedOrigins = [
   process.env.FRONTEND_URL,        // .env se aayega (local ya production)
+  'https://roomkhojoo.vercel.app', // Canonical production frontend
   'http://localhost:5173',          // Vite default port
   'http://localhost:5174',          // Vite alternate port
   'https://roomkhojoo.netlify.app', // User's Netlify Live App
-].filter(Boolean); // undefined values hata do
+].flatMap((value) => String(value || '').split(','))
+  .map((value) => {
+    try { return new URL(value.trim()).origin; } catch { return ''; }
+  })
+  .filter(Boolean);
 
 app.use(cors({
   origin: function (origin, callback) {
     // Postman ya server-to-server requests allow karo (origin undefined hoga)
     if (!origin) return callback(null, true);
-    
+
     if (allowedOrigins.includes(origin)) {
       callback(null, true);
     } else {
-      callback(new Error(`CORS Error: ${origin} ko allow nahi kiya gaya!`));
+      callback(new Error('CORS_BLOCKED'));
     }
   },
-  credentials: true, // Cookies/auth headers bhejna ho toh zaroori hai
+  credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'],
   allowedHeaders: ['Content-Type', 'Authorization'],
+  maxAge: 86400
 }));
 
 // 3. RATE LIMITING: Bot/DDoS attacks rokne ke liye
 // 🚦 Upstash Redis env set hone par shared store — serverless multiple instances par bhi limit asli
 const limiter = createLimiter('global', {
   windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 150, 
+  max: 150,
+  standardHeaders: true,
+  legacyHeaders: false,
   message: { success: false, message: 'Bahut zyada requests aa rahi hain. Kripya 15 minute baad try karein.' }
 });
-app.use('/api', limiter); 
+app.use('/api', limiter);
 
 // 4. PAYLOAD LIMITER: Badi files se server crash na ho
-app.use(express.json({ limit: '10kb' })); 
+app.use(express.json({ limit: '10kb' }));
+app.use(express.urlencoded({ extended: false, limit: '10kb' }));
 
 // 5. NoSQL INJECTION PROTECTION: MongoDB injection attacks rokta hai
 app.use(mongoSanitize());
 
-// 6. XSS PROTECTION: Express 5 safe recursive sanitization (fixes getter-only req.query issues)
-// 🔐 P0 fix: credential fields sanitize NAHI hote — warna password me `<`/`>`
-// (ya aisa kuch jo tag-jaisa lage) chupke se badal jata tha → silent login fail.
-const XSS_EXEMPT_KEYS = new Set(['password', 'oldPassword', 'newPassword', 'currentPassword', 'confirmPassword']);
-const cleanXss = (val, key) => {
-  if (typeof val === 'string') {
-    if (XSS_EXEMPT_KEYS.has(key)) return val;
-    return val.replace(/<script[^>]*>([\s\S]*?)<\/script>/gi, '')
-              .replace(/<[^>]*>/g, '');
-  }
-  if (Array.isArray(val)) {
-    return val.map((item) => cleanXss(item, key));
-  }
-  if (val && typeof val === 'object') {
-    const cleanObj = {};
-    for (const k in val) {
-      if (Object.prototype.hasOwnProperty.call(val, k)) {
-        cleanObj[k] = cleanXss(val[k], k);
-      }
-    }
-    return cleanObj;
-  }
-  return val;
-};
-
-const xssClean = (req, res, next) => {
-  if (req.body) req.body = cleanXss(req.body);
-  if (req.params) req.params = cleanXss(req.params);
+// 6. XSS/INPUT PROTECTION: tag/control-character cleanup, dangerous keys skip.
+// Credential fields exempt hain — warna password silently badal jata tha.
+const sanitizeRequest = (req, res, next) => {
+  if (req.body && typeof req.body === 'object') req.body = sanitizeDeep(req.body);
+  if (req.params && typeof req.params === 'object') req.params = sanitizeDeep(req.params);
   if (req.query) {
-    const cleanedQuery = cleanXss(req.query);
     Object.defineProperty(req, 'query', {
-      value: cleanedQuery,
+      value: sanitizeDeep(req.query),
       writable: true,
       configurable: true
     });
@@ -112,11 +117,17 @@ const xssClean = (req, res, next) => {
   next();
 };
 
-app.use(xssClean);
+app.use(sanitizeRequest);
 
 // ==========================================
 
-app.use(morgan('dev'));
+// Query strings me email/OTP/token aa sakte hain — URL ke bina log karo.
+app.use(morgan((tokens, req, res) => [
+  tokens.method(req, res),
+  String(req.path || '').slice(0, 200),
+  tokens.status(req, res),
+  `${tokens['response-time'](req, res)} ms`
+].join(' ')));
 
 // NOTE: '/uploads' static hata diya (B4 fix) — serverless filesystem
 // ephemeral hota hai, aur saari images waise bhi Cloudinary par hain.
@@ -150,39 +161,46 @@ app.get('/', (req, res) => {
 // --- SHARE PAGE /r/:id — sirf PURANE links ka redirect-fallback ---
 // Naye shares frontend deep-link (?room=) se jaate hain. Ye route kabhi
 // 500 nahi dega: DB fail ho ya ad na mile, toh bhi seedha app par redirect.
-const escHtml = (s) => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;')
-  .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-
 app.get('/r/:id', async (req, res) => {
-  const front = (process.env.FRONTEND_URL || 'https://roomkhojoo.vercel.app').replace(/\/$/, '');
-  const deepLink = `${front}/?room=${encodeURIComponent(req.params.id)}`;
+  const front = (process.env.FRONTEND_URL || 'https://roomkhojoo.vercel.app')
+    .split(',')[0].trim().replace(/\/$/, '');
+  const id = String(req.params.id || '');
+  const deepLink = `${front}/?room=${encodeURIComponent(id)}`;
+  if (!/^[a-f0-9]{24}$/i.test(id)) return res.redirect(302, deepLink);
   try {
     const Room = require('./models/Room');
-    const room = await Room.findById(req.params.id);
-    if (!room) return res.redirect(deepLink);
-    const title = escHtml(`${room.title} — ${room.price} | RoomKhojo`);
-    const desc = escHtml(`${room.category || ''} • ${room.type || ''} • ${room.landmark || 'Hanumangarh'} • ${room.ownerName || 'Owner'}`);
-    const img = room.image && room.image.startsWith('http') ? room.image
+    const room = await Room.findById(id).select('title price category type landmark ownerName image isApproved isActive').lean();
+    if (!room || !room.isApproved || !room.isActive) return res.redirect(302, deepLink);
+    const title = escapeHtml(`${room.title} — ${room.price} | RoomKhojo`);
+    const desc = escapeHtml(`${room.category || ''} • ${room.type || ''} • ${room.landmark || 'Hanumangarh'} • ${room.ownerName || 'Owner'}`);
+    const rawImage = String(room.image || '');
+    const img = /^https:\/\/[^\s"'<>]+$/i.test(rawImage) ? rawImage
       : 'https://images.unsplash.com/photo-1522708323590-d24dbb6b0267?w=800&q=80';
-    res.set('Content-Security-Policy', "default-src 'self' https:; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src *");
+    const safeDeepLink = escapeHtml(deepLink);
+    res.set('Cache-Control', 'public, max-age=300');
+    res.set('Content-Security-Policy', "default-src 'none'; img-src https: data:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'");
     res.status(200).send(`<!doctype html><html lang="hi"><head><meta charset="utf-8">`
       + `<title>${title}</title><meta name="description" content="${desc}">`
       + `<meta property="og:title" content="${title}"><meta property="og:description" content="${desc}">`
-      + `<meta property="og:image" content="${img}"><meta property="og:type" content="website">`
+      + `<meta property="og:image" content="${escapeHtml(img)}"><meta property="og:type" content="website">`
       + `<meta name="twitter:card" content="summary_large_image">`
-      + `<meta http-equiv="refresh" content="0;url=${deepLink}">`
-      + `</head><body><p>RoomKhojo ad khul raha hai… <a href="${deepLink}">Yahan click karo</a></p>`
-      + `<script>window.location.replace(${JSON.stringify(deepLink)});</script></body></html>`);
+      + `<meta http-equiv="refresh" content="0;url=${safeDeepLink}">`
+      + `</head><body><p>RoomKhojo ad khul raha hai… <a href="${safeDeepLink}">Yahan click karo</a></p>`
+      + `<script>window.location.replace(${JSON.stringify(deepLink).replace(/</g, '\\u003c')});</script></body></html>`);
   } catch (err) {
     console.error('Share-page error (redirecting anyway):', err.message);
-    return res.redirect(deepLink);
+    return res.redirect(302, deepLink);
   }
+});
+
+app.use('/api', (req, res) => {
+  res.status(404).json({ success: false, message: 'API endpoint nahi mila.' });
 });
 
 // --- GLOBAL ERROR HANDLER ---
 app.use((err, req, res, next) => {
-  if (err.message && err.message.startsWith('CORS Error')) {
-    return res.status(403).json({ success: false, message: err.message });
+  if (err.message === 'CORS_BLOCKED') {
+    return res.status(403).json({ success: false, message: 'Is origin se request allowed nahi hai.' });
   }
   // 🛡️ P1 #16: galat/toota JSON body → 400 (pehle 500 aata tha)
   if (err.type === 'entity.parse.failed') {
@@ -203,7 +221,8 @@ app.use((err, req, res, next) => {
         : 'Photo upload me dikkat aayi. Dobara try karein.';
     return res.status(400).json({ success: false, message: msg });
   }
-  if (err.message === 'Sirf JPG, PNG ya WebP photo allowed hai.') {
+  if (err.message === 'Sirf JPG, PNG ya WebP photo allowed hai.'
+    || err.message === 'Photo file valid image nahi hai.') {
     return res.status(400).json({ success: false, message: err.message });
   }
   console.error('❌ Server Error:', err.message);

@@ -13,16 +13,34 @@ cloudinary.config({
 const upload = multer({
   storage: multer.memoryStorage(),
   // H3 fix: unlimited upload DoS rokne ke liye — har file max 2MB, max 6 files
-  limits: { fileSize: 2 * 1024 * 1024, files: 6 },
+  limits: {
+    fileSize: 2 * 1024 * 1024,
+    files: 6,
+    fields: 30,
+    parts: 40,
+    fieldSize: 100 * 1024
+  },
   fileFilter: (req, file, cb) => {
     if (/^image\/(jpe?g|png|webp)$/.test(file.mimetype)) return cb(null, true);
     cb(new Error('Sirf JPG, PNG ya WebP photo allowed hai.'));
   }
 });
 
+const isAllowedImageBuffer = (buffer) => {
+  if (!Buffer.isBuffer(buffer) || buffer.length < 12) return false;
+  const jpeg = buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff;
+  const png = buffer.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+  const webp = buffer.subarray(0, 4).toString('ascii') === 'RIFF'
+    && buffer.subarray(8, 12).toString('ascii') === 'WEBP';
+  return jpeg || png || webp;
+};
+
 // Buffer → Cloudinary (secure_url wapas milta hai, DB me wahi save hota hai)
 // P1 #23: timeout 60s — Cloudinary hang ho toh request kabhi na latke.
 const uploadBufferToCloudinary = (file) => new Promise((resolve, reject) => {
+  if (!file || !isAllowedImageBuffer(file.buffer)) {
+    return reject(new Error('Photo file valid image nahi hai.'));
+  }
   const uploadStream = cloudinary.uploader.upload_stream(
     { folder: 'roomkhojo_ads', allowed_formats: ['jpg', 'png', 'jpeg', 'webp'], timeout: 60000 },
     (error, result) => (error ? reject(error) : resolve(result))

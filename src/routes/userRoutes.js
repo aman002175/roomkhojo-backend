@@ -13,6 +13,9 @@ const ActionOtp = require('../models/ActionOtp');
 const mongoose = require('mongoose');
 const { signUser, requireAuth, requireAdmin } = require('../middleware/auth');
 const { sendOtpEmail, sendOtpEmailFor } = require('../config/mailer');
+const { hashOtp, hashResetToken, safeEqual, cleanText, passwordProblem } = require('../utils/security');
+const { logAudit, archiveRooms } = require('../utils/audit');
+const { PUBLIC_ROOM_EXCLUDE } = require('../utils/roomProjection');
 
 // Brute-force protection (H4): login/google par 15 min me max 20,
 // OTP maangne par 15 min me max 10 (plus per-email 3/15min andar)
@@ -76,33 +79,49 @@ const isWeakPassword = (pw) => {
   if (/^(0123456789|9876543210|abcdefgh|12345678|87654321)/.test(v.toLowerCase())) return true;
   return false;
 };
+const passwordError = (value, min = 8) => passwordProblem(value, min)
+  || (isWeakPassword(value) ? 'Ye password bahut common hai. Strong password chunein.' : '');
+const emailValue = (value) => {
+  if (typeof value !== 'string') return '';
+  const email = value.trim().toLowerCase();
+  return email.length <= 254 ? email : '';
+};
+const otpValue = (value) => (typeof value === 'string' ? value.trim().slice(0, 10) : '');
+const otpMatches = (input, stored) => Boolean(stored) && safeEqual(hashOtp(otpValue(input)), stored);
+const lockMessage = 'Bahut zyada galat attempts. 15 minute baad try karein.';
+const MAX_LOGIN_FAILURES = 5;
+const LOGIN_LOCK_MS = 15 * 60 * 1000;
+
+router.use((req, res, next) => {
+  res.set('Cache-Control', 'no-store');
+  next();
+});
 
 // 1. Signup step-1: email OTP bhejo (account ab OTP verify hone par hi banta hai)
 // Password is request me validate hota hai par store NAHI hota — verify par dobara aata hai.
 router.post('/signup/request-otp', otpRequestLimiter, async (req, res) => {
   try {
-    const { name, phone, email, password } = req.body || {};
-    if (!name || !phone || !email || !password) {
+    const body = req.body || {};
+    const { name, phone, password } = body;
+    const cleanEmail = emailValue(body.email);
+    if (typeof name !== 'string' || !phone || !cleanEmail || typeof password !== 'string') {
       return res.status(400).json({ success: false, message: 'Naam, Mobile, Email aur Password charo zaroori hain.' });
     }
-    if (!isValidEmail(email)) {
+    if (!isValidEmail(cleanEmail)) {
       return res.status(400).json({ success: false, message: 'Sahi email address daliye.' });
     }
-    const cleanName = String(name).trim();
-    if (cleanName.length < 2 || cleanName.length > 60) {
+    const cleanName = cleanText(name, 60);
+    if (cleanName.length < 2) {
       return res.status(400).json({ success: false, message: 'Naam 2-60 characters ka ho.' });
     }
     const cleanNumber = cleanPhone(phone);
     if (!cleanNumber) {
       return res.status(400).json({ success: false, message: 'Sahi 10-digit mobile number daliye.' });
     }
-    if (String(password).length < 8) {
-      return res.status(400).json({ success: false, message: 'Password kam se kam 8 characters ka ho.' });
+    const pwError = passwordError(password);
+    if (pwError) {
+      return res.status(400).json({ success: false, message: pwError });
     }
-    if (isWeakPassword(password)) {
-      return res.status(400).json({ success: false, message: 'Ye password bahut common hai. Strong password chunein.' });
-    }
-    const cleanEmail = String(email).toLowerCase().trim();
     if (await User.findOne({ email: cleanEmail })) {
       return res.status(409).json({ success: false, message: 'Ye Email pehle se registered hai. Sign in karein.' });
     }
@@ -119,7 +138,7 @@ router.post('/signup/request-otp', otpRequestLimiter, async (req, res) => {
       {
         name: cleanName,
         phone: cleanNumber,
-        otpHash: sha256(otp),
+        otpHash: hashOtp(otp),
         otpExpires: new Date(Date.now() + 10 * 60 * 1000),
         attempts: 0,
         lastSentAt: now,
@@ -147,14 +166,17 @@ router.post('/signup/request-otp', otpRequestLimiter, async (req, res) => {
 // 1b. Signup step-2: OTP verify → account create + login token
 router.post('/signup/verify-otp', otpVerifyLimiter, async (req, res) => {
   try {
-    const { email, otp, password } = req.body || {};
-    if (!email || !otp || !password) {
+    const body = req.body || {};
+    const cleanEmail = emailValue(body.email);
+    const cleanOtp = otpValue(body.otp);
+    const password = body.password;
+    if (!cleanEmail || !cleanOtp || typeof password !== 'string') {
       return res.status(400).json({ success: false, message: 'Email, OTP aur Password zaroori hain.' });
     }
-    if (String(password).length < 8 || isWeakPassword(password)) {
-      return res.status(400).json({ success: false, message: 'Password strong (8+ characters) hona chahiye.' });
+    const pwError = passwordError(password);
+    if (pwError) {
+      return res.status(400).json({ success: false, message: pwError });
     }
-    const cleanEmail = String(email).toLowerCase().trim();
     const record = await SignupRequest.findOne({ email: cleanEmail });
     if (!record || !record.otpHash || !record.otpExpires || record.otpExpires < new Date()) {
       return res.status(400).json({ success: false, message: 'OTP galat ya expire ho gaya hai. Naya OTP bhejein.' });
@@ -162,9 +184,8 @@ router.post('/signup/verify-otp', otpVerifyLimiter, async (req, res) => {
     if ((record.attempts || 0) >= 5) {
       return res.status(429).json({ success: false, message: 'Bahut zyada galat attempts. Naya OTP bhejein.' });
     }
-    if (sha256(String(otp).trim()) !== record.otpHash) {
-      record.attempts = (record.attempts || 0) + 1;
-      await record.save();
+    if (!otpMatches(cleanOtp, record.otpHash)) {
+      await SignupRequest.updateOne({ _id: record._id, attempts: { $lt: 5 } }, { $inc: { attempts: 1 } });
       return res.status(400).json({ success: false, message: 'OTP galat hai.' });
     }
     if (await User.findOne({ email: cleanEmail })) {
@@ -197,27 +218,49 @@ router.post('/signup', authLimiter, (req, res) => {
 // 2. Email & Password Login (bcrypt compare + JWT — C4/C7 fix)
 router.post('/login', authLimiter, async (req, res) => {
   try {
-    const { email, password } = req.body || {};
-    if (!email || !password) {
-      console.warn('Login 400: missing fields', { hasEmail: Boolean(email), hasPassword: Boolean(password) });
+    const body = req.body || {};
+    const cleanEmail = emailValue(body.email);
+    const password = body.password;
+    if (!cleanEmail || typeof password !== 'string') {
       return res.status(400).json({ success: false, message: 'Email aur Password dono zaroori hain.' });
     }
-    const user = await User.findOne({ email: email.toLowerCase().trim() });
-    if (!user || !(await user.comparePassword(password))) {
-      console.warn('Login 401: userExists=', Boolean(user));
+    if (password.length > 200) {
+      return res.status(401).json({ success: false, message: 'Email ya Password galat hai!' });
+    }
+    const user = await User.findOne({ email: cleanEmail });
+    if (!user) {
+      return res.status(401).json({ success: false, message: 'Email ya Password galat hai!' });
+    }
+    if (user.lockedUntil && user.lockedUntil > new Date()) {
+      return res.status(429).json({ success: false, message: lockMessage });
+    }
+    if (!(await user.comparePassword(password))) {
+      user.failedLoginAttempts = (user.failedLoginAttempts || 0) + 1;
+      if (user.failedLoginAttempts >= MAX_LOGIN_FAILURES) {
+        user.lockedUntil = new Date(Date.now() + LOGIN_LOCK_MS);
+        user.failedLoginAttempts = 0;
+      }
+      await user.save();
       return res.status(401).json({ success: false, message: 'Email ya Password galat hai!' });
     }
     const blockedMsg = accountBlockMessage(user);
     if (blockedMsg) return res.status(403).json({ success: false, message: blockedMsg });
+    let dirty = false;
+    if (user.failedLoginAttempts || user.lockedUntil) {
+      user.failedLoginAttempts = 0;
+      user.lockedUntil = null;
+      dirty = true;
+    }
     // Login par checkbox tick tha → consent proof update (acceptedTerms FE bhejta hai)
-    if (req.body && req.body.acceptedTerms === true) {
+    if (body.acceptedTerms === true) {
       if (user.termsVersion !== TERMS_VERSION) {
         ConsentLog.create({ emailHash: sha256(user.email.toLowerCase().trim()), termsVersion: TERMS_VERSION }).catch(() => {});
       }
       user.termsAcceptedAt = new Date();
       user.termsVersion = TERMS_VERSION;
-      await user.save();
+      dirty = true;
     }
+    if (dirty) await user.save();
     const token = signUser(user);
     res.json({ success: true, message: `Welcome ${user.name}!`, token, user: publicUser(user) });
   } catch (error) {
@@ -242,21 +285,25 @@ router.post('/google', authLimiter, async (req, res) => {
     const client = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
     const ticket = await verifyGoogleToken(client, idToken); // P1 #23 (8s timeout)
     const payload = ticket.getPayload();
-    if (!payload || !payload.email || !payload.email_verified) {
+    const googleEmail = emailValue(payload && payload.email);
+    if (!payload || !googleEmail || !payload.email_verified) {
       return res.status(401).json({ success: false, message: 'Google verification fail ho gayi.' });
     }
 
-    let user = await User.findOne({ email: payload.email.toLowerCase() });
+    let user = await User.findOne({ email: googleEmail });
     if (!user) {
+      const picture = typeof payload.picture === 'string' && /^https:\/\//i.test(payload.picture)
+        ? payload.picture.slice(0, 500)
+        : '';
       user = await User.create({
-        name: payload.name || 'User',
-        email: payload.email,
-        profilePic: payload.picture || '',
+        name: cleanText(payload.name, 60) || 'User',
+        email: googleEmail,
+        profilePic: picture,
         isGoogleUser: true,
         termsAcceptedAt: new Date(),
         termsVersion: TERMS_VERSION
       });
-      ConsentLog.create({ emailHash: sha256(payload.email.toLowerCase()), termsVersion: TERMS_VERSION }).catch(() => {});
+      ConsentLog.create({ emailHash: sha256(googleEmail), termsVersion: TERMS_VERSION }).catch(() => {});
     } else {
       const blockedMsg = accountBlockMessage(user);
       if (blockedMsg) return res.status(403).json({ success: false, message: blockedMsg });
@@ -283,23 +330,22 @@ router.post('/google', authLimiter, async (req, res) => {
 // User ho ya na ho, response same (account enumeration rokne ke liye).
 router.post('/forgot-password', otpRequestLimiter, async (req, res) => {
   try {
-    const { email } = req.body || {};
-    if (!email || !isValidEmail(email)) {
+    const cleanEmail = emailValue(req.body && req.body.email);
+    if (!cleanEmail || !isValidEmail(cleanEmail)) {
       // Invalid format par bhi generic response (enumeration oracle nahi banana)
       return res.json({ success: true, message: 'Agar ye email registered hai toh OTP bhej diya gaya hai.' });
     }
     const done = () => res.json({ success: true, message: 'Agar ye email registered hai toh OTP bhej diya gaya hai.' });
 
-    const user = await User.findOne({ email: email.toLowerCase().trim() });
+    const user = await User.findOne({ email: cleanEmail });
     if (!user || user.isGoogleUser || !user.password) return done(); // Google users ka password reset nahi hota
 
     // Per-email abuse limit: 15 min window me max 3 OTP
     const now = new Date();
     const record = await Otp.findOne({ email: user.email });
     if (record && record.sendWindowStart && (now - record.sendWindowStart) < 15 * 60 * 1000) {
-      if ((record.sendCount || 0) >= 3) {
-        return res.status(429).json({ success: false, message: 'Bahut zyada OTP requests. 15 minute baad try karein.' });
-      }
+      // Same generic response (registered vs unregistered enumeration na ho)
+      if ((record.sendCount || 0) >= 3) return done();
     }
     const inWindow = record && record.sendWindowStart && (now - record.sendWindowStart) < 15 * 60 * 1000;
 
@@ -307,7 +353,7 @@ router.post('/forgot-password', otpRequestLimiter, async (req, res) => {
     await Otp.findOneAndUpdate(
       { email: user.email },
       {
-        otpHash: sha256(otp),
+        otpHash: hashOtp(otp),
         otpExpires: new Date(Date.now() + 10 * 60 * 1000),
         attempts: 0,
         resetTokenHash: null,
@@ -339,29 +385,38 @@ router.post('/forgot-password', otpRequestLimiter, async (req, res) => {
 // 5. OTP Verify — sahi hone par single-use reset token (R2)
 router.post('/verify-otp', otpVerifyLimiter, async (req, res) => {
   try {
-    const { email, otp } = req.body || {};
-    if (!email || !otp) {
+    const cleanEmail = emailValue(req.body && req.body.email);
+    const cleanOtp = otpValue(req.body && req.body.otp);
+    if (!cleanEmail || !cleanOtp) {
       return res.status(400).json({ success: false, message: 'Email aur OTP dono zaroori hain.' });
     }
-    const record = await Otp.findOne({ email: email.toLowerCase().trim() });
+    const record = await Otp.findOne({ email: cleanEmail });
     if (!record || !record.otpHash || !record.otpExpires || record.otpExpires < new Date()) {
       return res.status(400).json({ success: false, message: 'OTP galat ya expire ho gaya hai. Naya OTP mangwayein.' });
     }
     if ((record.attempts || 0) >= 5) {
       return res.status(429).json({ success: false, message: 'Bahut zyada galat attempts. Naya OTP mangwayein.' });
     }
-    if (sha256(String(otp).trim()) !== record.otpHash) {
-      record.attempts = (record.attempts || 0) + 1;
-      await record.save();
+    if (!otpMatches(cleanOtp, record.otpHash)) {
+      await Otp.updateOne({ _id: record._id, attempts: { $lt: 5 } }, { $inc: { attempts: 1 } });
       return res.status(400).json({ success: false, message: 'OTP galat hai.' });
     }
     const resetToken = crypto.randomBytes(32).toString('hex');
-    record.resetTokenHash = sha256(resetToken);
-    record.resetExpires = new Date(Date.now() + 15 * 60 * 1000);
-    record.otpHash = null;
-    record.otpExpires = null;
-    record.attempts = 0;
-    await record.save();
+    const consumed = await Otp.findOneAndUpdate(
+      { _id: record._id, otpHash: record.otpHash, attempts: { $lt: 5 } },
+      {
+        $set: {
+          resetTokenHash: hashResetToken(resetToken),
+          resetExpires: new Date(Date.now() + 15 * 60 * 1000),
+          otpHash: null,
+          otpExpires: null,
+          attempts: 0
+        }
+      }
+    );
+    if (!consumed) {
+      return res.status(400).json({ success: false, message: 'OTP galat ya expire ho gaya hai. Naya OTP mangwayein.' });
+    }
     res.json({ success: true, message: 'OTP verify ho gaya.', resetToken });
   } catch (error) {
     console.error('Verify-otp error:', error.message);
@@ -373,29 +428,36 @@ router.post('/verify-otp', otpVerifyLimiter, async (req, res) => {
 // Saare puraane sessions invalidate ho jaate hain (tokenVersion bump).
 router.post('/reset-password', otpVerifyLimiter, async (req, res) => {
   try {
-    const { email, resetToken, newPassword } = req.body || {};
-    if (!email || !resetToken || !newPassword) {
+    const body = req.body || {};
+    const cleanEmail = emailValue(body.email);
+    const resetToken = typeof body.resetToken === 'string' ? body.resetToken.trim().slice(0, 200) : '';
+    const newPassword = body.newPassword;
+    if (!cleanEmail || !resetToken || typeof newPassword !== 'string') {
       return res.status(400).json({ success: false, message: 'Email, token aur naya password zaroori hain.' });
     }
-    if (newPassword.length < 8) {
-      return res.status(400).json({ success: false, message: 'Password kam se kam 8 characters ka ho.' });
-    }
-    if (isWeakPassword(newPassword)) {
-      return res.status(400).json({ success: false, message: 'Ye password bahut common hai. Strong password chunein.' });
-    }
-    const record = await Otp.findOne({ email: email.toLowerCase().trim() });
+    const pwError = passwordError(newPassword);
+    if (pwError) return res.status(400).json({ success: false, message: pwError });
+    const record = await Otp.findOne({ email: cleanEmail });
     if (!record || !record.resetTokenHash || !record.resetExpires || record.resetExpires < new Date()
-        || sha256(resetToken) !== record.resetTokenHash) {
+        || !safeEqual(hashResetToken(resetToken), record.resetTokenHash)) {
       return res.status(400).json({ success: false, message: 'Link galat ya expire ho gaya hai. Dobara OTP mangwayein.' });
     }
-    const user = await User.findOne({ email: email.toLowerCase().trim() });
+    const user = await User.findOne({ email: cleanEmail });
     if (!user) {
       return res.status(400).json({ success: false, message: 'Account nahi mila.' });
     }
+    const consumed = await Otp.findOneAndUpdate(
+      { _id: record._id, resetTokenHash: record.resetTokenHash, resetExpires: { $gt: new Date() } },
+      { $set: { resetTokenHash: null, resetExpires: null } }
+    );
+    if (!consumed) {
+      return res.status(400).json({ success: false, message: 'Link galat ya expire ho gaya hai. Dobara OTP mangwayein.' });
+    }
     user.password = newPassword; // Model hook hash karega
     user.tokenVersion = (user.tokenVersion || 0) + 1;
+    user.failedLoginAttempts = 0;
+    user.lockedUntil = null;
     await user.save();
-    await Otp.deleteOne({ email: user.email }); // Token single-use tha
     res.json({ success: true, message: 'Password badal gaya hai. Dobara login karein.' });
   } catch (error) {
     console.error('Reset-password error:', error.message);
@@ -406,15 +468,16 @@ router.post('/reset-password', otpVerifyLimiter, async (req, res) => {
 // 7. Logged-in user ka password change (R4)
 router.post('/change-password', requireAuth, async (req, res) => {
   try {
-    const { oldPassword, newPassword } = req.body || {};
-    if (!oldPassword || !newPassword) {
+    const body = req.body || {};
+    const oldPassword = body.oldPassword;
+    const newPassword = body.newPassword;
+    if (typeof oldPassword !== 'string' || typeof newPassword !== 'string' || !oldPassword || !newPassword) {
       return res.status(400).json({ success: false, message: 'Puraana aur naya password dono zaroori hain.' });
     }
-    if (newPassword.length < 8) {
-      return res.status(400).json({ success: false, message: 'Password kam se kam 8 characters ka ho.' });
-    }
-    if (isWeakPassword(newPassword)) {
-      return res.status(400).json({ success: false, message: 'Ye password bahut common hai. Strong password chunein.' });
+    const pwError = passwordError(newPassword);
+    if (pwError) return res.status(400).json({ success: false, message: pwError });
+    if (oldPassword.length > 200) {
+      return res.status(401).json({ success: false, message: 'Puraana password galat hai!' });
     }
     const user = await User.findById(req.user.id);
     if (!user || !(await user.comparePassword(oldPassword))) {
@@ -433,11 +496,12 @@ router.post('/change-password', requireAuth, async (req, res) => {
 // P2 #48 + #6: Email change — nayi email par OTP verify hone ke baad hi update
 router.post('/change-email/request-otp', otpRequestLimiter, requireAuth, async (req, res) => {
   try {
-    const { password, newEmail } = req.body || {};
-    if (!isValidEmail(newEmail)) {
+    const body = req.body || {};
+    const cleanEmail = emailValue(body.newEmail);
+    const password = body.password;
+    if (!cleanEmail || !isValidEmail(cleanEmail)) {
       return res.status(400).json({ success: false, message: 'Sahi naya email address daliye.' });
     }
-    const cleanEmail = String(newEmail).toLowerCase().trim();
     const user = await User.findById(req.user.id);
     if (!user) return res.status(404).json({ success: false, message: 'Account nahi mila.' });
     if (!user.password || user.isGoogleUser) {
@@ -446,7 +510,7 @@ router.post('/change-email/request-otp', otpRequestLimiter, requireAuth, async (
     if (cleanEmail === user.email) {
       return res.status(400).json({ success: false, message: 'Ye wahi purana email hai.' });
     }
-    if (!password || !(await user.comparePassword(password))) {
+    if (typeof password !== 'string' || !password || password.length > 200 || !(await user.comparePassword(password))) {
       return res.status(401).json({ success: false, message: 'Password galat hai!' });
     }
     if (await User.findOne({ email: cleanEmail })) {
@@ -464,7 +528,7 @@ router.post('/change-email/request-otp', otpRequestLimiter, requireAuth, async (
       { userId: user._id, purpose: 'email-change' },
       {
         newEmail: cleanEmail,
-        otpHash: sha256(otp),
+        otpHash: hashOtp(otp),
         otpExpires: new Date(Date.now() + 10 * 60 * 1000),
         attempts: 0,
         lastSentAt: now,
@@ -491,11 +555,11 @@ router.post('/change-email/request-otp', otpRequestLimiter, requireAuth, async (
 
 router.post('/change-email/verify', otpVerifyLimiter, requireAuth, async (req, res) => {
   try {
-    const { newEmail, otp } = req.body || {};
-    if (!isValidEmail(newEmail) || !otp) {
+    const cleanEmail = emailValue(req.body && req.body.newEmail);
+    const cleanOtp = otpValue(req.body && req.body.otp);
+    if (!cleanEmail || !isValidEmail(cleanEmail) || !cleanOtp) {
       return res.status(400).json({ success: false, message: 'Naya email aur OTP dono zaroori hain.' });
     }
-    const cleanEmail = String(newEmail).toLowerCase().trim();
     const user = await User.findById(req.user.id);
     if (!user) return res.status(404).json({ success: false, message: 'Account nahi mila.' });
     if (!user.password || user.isGoogleUser) {
@@ -508,9 +572,8 @@ router.post('/change-email/verify', otpVerifyLimiter, requireAuth, async (req, r
     if ((record.attempts || 0) >= 5) {
       return res.status(429).json({ success: false, message: 'Bahut zyada galat attempts. Naya OTP bhejein.' });
     }
-    if (sha256(String(otp).trim()) !== record.otpHash) {
-      record.attempts = (record.attempts || 0) + 1;
-      await record.save();
+    if (!otpMatches(cleanOtp, record.otpHash)) {
+      await ActionOtp.updateOne({ _id: record._id, attempts: { $lt: 5 } }, { $inc: { attempts: 1 } });
       return res.status(400).json({ success: false, message: 'OTP galat hai.' });
     }
     if (await User.findOne({ email: cleanEmail })) {
@@ -549,7 +612,7 @@ router.post('/delete-account/request-otp', otpRequestLimiter, requireAuth, async
       { userId: user._id, purpose: 'delete-account' },
       {
         newEmail: '',
-        otpHash: sha256(otp),
+        otpHash: hashOtp(otp),
         otpExpires: new Date(Date.now() + 10 * 60 * 1000),
         attempts: 0,
         lastSentAt: now,
@@ -578,11 +641,13 @@ router.post('/delete-account/request-otp', otpRequestLimiter, requireAuth, async
 // Cloudinary images best-effort destroy (bounded) — fail ho toh delete rukna nahi chahiye.
 router.post('/delete-account', otpVerifyLimiter, requireAuth, async (req, res) => {
   try {
-    const { otp, confirm } = req.body || {};
+    const body = req.body || {};
+    const confirm = body.confirm;
+    const cleanOtp = otpValue(body.otp);
     if (confirm !== 'DELETE') {
       return res.status(400).json({ success: false, message: 'Confirm ke liye DELETE likhein.' });
     }
-    if (!otp) {
+    if (!cleanOtp) {
       return res.status(400).json({ success: false, message: 'Pehle email par OTP bhejein, phir OTP dalein.' });
     }
     const user = await User.findById(req.user.id);
@@ -594,13 +659,24 @@ router.post('/delete-account', otpVerifyLimiter, requireAuth, async (req, res) =
     if ((record.attempts || 0) >= 5) {
       return res.status(429).json({ success: false, message: 'Bahut zyada galat attempts. Naya OTP bhejein.' });
     }
-    if (sha256(String(otp).trim()) !== record.otpHash) {
-      record.attempts = (record.attempts || 0) + 1;
-      await record.save();
+    if (!otpMatches(cleanOtp, record.otpHash)) {
+      await ActionOtp.updateOne({ _id: record._id, attempts: { $lt: 5 } }, { $inc: { attempts: 1 } });
       return res.status(400).json({ success: false, message: 'OTP galat hai.' });
     }
-    // Delete se pehle image URLs jama karo (baad me docs gayab ho jayenge)
-    const rooms = await Room.find({ userId: user._id }).select('image images').lean();
+    // Delete se pehle archive + image URLs jama karo (baad me docs gayab ho jayenge).
+    // 1001 dekh kar >1000 par abort — warna baaki rooms bina archive delete ho jate.
+    const rooms = await Room.find({ userId: user._id }).limit(1001).lean();
+    if (rooms.length > 1000) {
+      return res.status(503).json({ success: false, message: 'Account me bahut zyada ads hain. Support se delete karwayein.' });
+    }
+    const archived = await archiveRooms(rooms, {
+      deletedBy: req.user.id,
+      deletedByRole: 'user',
+      reason: 'self account delete'
+    });
+    if (rooms.length > 0 && archived < rooms.length) {
+      return res.status(500).json({ success: false, message: 'Delete safety check fail hua. Baad me try karein.' });
+    }
     const urls = [];
     rooms.forEach((r) => {
       if (r.image && /^https?:\/\//.test(r.image)) urls.push(r.image);
@@ -622,6 +698,7 @@ router.post('/delete-account', otpVerifyLimiter, requireAuth, async (req, res) =
       const upload = require('../config/cloudinary');
       if (urls.length > 0) await upload.destroyByUrls(urls);
     } catch { /* orphan images maaf — account delete ho chuka */ }
+    await logAudit(req, { action: 'user.account_deleted', targetType: 'user', targetId: user._id, actorId: user._id, actorRole: 'user', details: { rooms: rooms.length } });
     res.json({ success: true, message: 'Account aur saare ads delete ho gaye. Alvida!' });
   } catch (error) {
     console.error('Delete-account error:', error.message);
@@ -646,8 +723,11 @@ router.patch('/profile', requireAuth, async (req, res) => {
     }
     let cleanName = '';
     if (hasName) {
-      cleanName = String(body.name || '').trim();
-      if (cleanName.length < 2 || cleanName.length > 60) {
+      if (typeof body.name !== 'string') {
+        return res.status(400).json({ success: false, message: 'Naam 2-60 characters ka ho.' });
+      }
+      cleanName = cleanText(body.name, 60);
+      if (cleanName.length < 2) {
         return res.status(400).json({ success: false, message: 'Naam 2-60 characters ka ho.' });
       }
     }
@@ -673,8 +753,11 @@ router.patch('/profile', requireAuth, async (req, res) => {
 // 10. ❤️ Saved ads list (full room data ke saath)
 router.get('/favorites', requireAuth, async (req, res) => {
   try {
+    res.set('Cache-Control', 'no-store');
     const favs = await Favorite.find({ userId: req.user.id }).sort({ createdAt: -1 });
-    const rooms = await Room.find({ _id: { $in: favs.map((f) => f.roomId) } });
+    const rooms = await Room.find({ _id: { $in: favs.map((f) => f.roomId) } })
+      .select(PUBLIC_ROOM_EXCLUDE)
+      .lean();
     const order = {};
     favs.forEach((f, i) => { order[f.roomId.toString()] = i; });
     rooms.sort((a, b) => (order[a._id.toString()] || 0) - (order[b._id.toString()] || 0));

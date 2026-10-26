@@ -8,6 +8,16 @@ const Settings = require('../models/Settings');
 const upload = require('../config/cloudinary');
 const ContactReveal = require('../models/ContactReveal');
 const { requireAuth, requireAdmin } = require('../middleware/auth');
+const { createLimiter } = require('../utils/rateStore');
+const { normalizeMapUrl, fetchMapPage, cleanText, sanitizeDeep } = require('../utils/security');
+const { logAudit, archiveRooms } = require('../utils/audit');
+const { PUBLIC_ROOM_EXCLUDE } = require('../utils/roomProjection');
+
+const viewLimiter = createLimiter('ad-view', {
+  windowMs: 15 * 60 * 1000,
+  max: 200,
+  message: { success: false, message: 'Bahut zyada requests. Thodi der baad try karein.' }
+});
 
 // Audience types (category-wise frontend options ka union — backend guard)
 const ALLOWED_TYPES = ['Boys', 'Girls', 'Family', 'Anyone'];
@@ -36,14 +46,20 @@ const cleanPrice = (raw) => {
   return `₹${Math.round(n)}`;
 };
 
+// Settings me prices String ("₹299" / "299") hain — fee comparison ke liye number.
+const moneyNum = (raw) => {
+  const n = Number(String(raw == null ? '' : raw).replace(/[^\d.]/g, ''));
+  return Number.isFinite(n) && n > 0 ? Math.round(n) : 0;
+};
+
 // 📍 Landmarks parse+validate (max 8, naam 120 chars, valid coords)
 const cleanLandmarks = (raw) => {
   try {
     const arr = JSON.parse(raw || '[]');
     if (!Array.isArray(arr)) return [];
     return arr.slice(0, 8).map((l) => ({
-      name: String((l && l.name) || '').trim().slice(0, 120),
-      cat: String((l && l.cat) || '').trim().slice(0, 30),
+      name: cleanText(l && l.name, 120),
+      cat: cleanText(l && l.cat, 30),
       lat: Number(l && l.lat),
       lng: Number(l && l.lng),
       distM: Math.max(0, Math.round(Number((l && l.distM) || 0)))
@@ -67,6 +83,7 @@ const cleanMobile = (raw) => {
 
 // Coordinate validation (range ke saath)
 const toCoord = (val, min, max) => {
+  if (val === '' || val === null || val === undefined) return null;
   const n = Number(val);
   return Number.isFinite(n) && n >= min && n <= max ? n : null;
 };
@@ -76,21 +93,21 @@ const serverError = (res, err, label) => {
   res.status(500).json({ success: false, message: 'Server me gadbad hai. Baad me try karein.' });
 };
 
+// multer global xss-clean ke BAAD body parse karta hai — multipart fields ko
+// yahan explicitly sanitize karo (warna room text fields raw DB me ja sakte hain).
+const sanitizeMultipart = (req, res, next) => {
+  if (req.body && typeof req.body === 'object') req.body = sanitizeDeep(req.body);
+  next();
+};
+
+const isCloudinaryUrl = (value) => typeof value === 'string'
+  && /^https:\/\/res\.cloudinary\.com\/[^\s"'<>]+$/i.test(value);
+
 // 🛡️ P1 #15 fix: URL me galat id (e.g. /api/rooms/abc/edit) → CastError 500 ki jagah clean 404
-// 🗺️ Google Maps link (optional) — sirf Google domains allowed (SSRF-safe)
+// 🗺️ Google Maps link (optional) — strict Google host allowlist + https only
 const cleanMapUrl = (raw) => {
-  const s = String(raw || '').trim();
-  if (!s) return '';
-  if (s.length > 300) return null;
-  let u;
-  try { u = new URL(s); } catch { return null; }
-  if (u.protocol !== 'https:' && u.protocol !== 'http:') return null;
-  if (u.username || u.password) return null;
-  const host = u.hostname.toLowerCase();
-  const isGoogle = /(^|\.)google\.[a-z]{2,}(\.[a-z]{2,})?$/.test(host);
-  const isShort = host === 'goo.gl' || host === 'maps.app.goo.gl';
-  if (!isGoogle && !isShort) return null;
-  return u.toString();
+  if (raw === undefined || raw === null || raw === '') return '';
+  return normalizeMapUrl(raw);
 };
 
 // Link ke andar embedded coordinates nikaalo (short links ko expand karke bhi try)
@@ -116,17 +133,11 @@ const coordsFromText = (text) => {
 const coordsFromMapUrl = async (urlStr) => {
   const direct = coordsFromText(urlStr);
   if (direct) return direct;
-  // goo.gl / maps.app.goo.gl short link → expand (5s timeout, sirf Google hosts)
+  // goo.gl / maps.app.goo.gl short link → manual redirect expansion, sirf Google hosts,
+  // private-IP DNS guard + 200KB response cap (SSRF/DoS-safe).
   try {
-    const res = await fetch(urlStr, {
-      redirect: 'follow',
-      signal: AbortSignal.timeout(5000),
-      headers: { 'User-Agent': 'RoomKhojo/1.0 (+https://roomkhojoo.vercel.app)' }
-    });
-    const fromFinalUrl = coordsFromText(res.url || '');
-    if (fromFinalUrl) return fromFinalUrl;
-    const html = await res.text();
-    return coordsFromText(html.slice(0, 200000));
+    const { text, finalUrl } = await fetchMapPage(urlStr, { timeoutMs: 5000, maxBytes: 200000 });
+    return coordsFromText(finalUrl) || coordsFromText(text);
   } catch { return null; }
 };
 
@@ -147,6 +158,7 @@ router.param('id', (req, res, next, id) => {
 // --- ADMIN: saare rooms (ADMIN ONLY — pehle x-admin-secret header tha, ab JWT) ---
 router.get('/admin/all', requireAdmin, async (req, res) => {
   try {
+    res.set('Cache-Control', 'no-store');
     // P1 #19: unbounded dump band — cap 1000 + lean (admin list isse chhoti hai)
     const rooms = await Room.find().sort({ createdAt: -1 }).limit(1000).lean();
     res.status(200).json({ success: true, rooms });
@@ -156,6 +168,7 @@ router.get('/admin/all', requireAdmin, async (req, res) => {
 // --- ADMIN: purane-ad claim requests (#13 fix — mobile match hui hain, admin verify kare) ---
 router.get('/admin/claims', requireAdmin, async (req, res) => {
   try {
+    res.set('Cache-Control', 'no-store');
     const rooms = await Room.find({ claimRequestedAt: { $ne: null } })
       .sort({ claimRequestedAt: -1 })
       .select('title image price mobile ownerName userId claimRequestedBy claimRequestName claimRequestedAt');
@@ -176,6 +189,7 @@ router.post('/admin/claims/:id/approve', requireAdmin, async (req, res) => {
     room.claimRequestName = '';
     room.claimRequestedAt = null;
     await room.save();
+    await logAudit(req, { action: 'room.claim.approve', targetType: 'room', targetId: room._id, details: { claimantId: String(room.userId) } });
     res.json({ success: true, message: 'Ad claimant ke account se link ho gaya.', room });
   } catch (error) { serverError(res, error, 'Claim approve error'); }
 });
@@ -188,6 +202,7 @@ router.post('/admin/claims/:id/reject', requireAdmin, async (req, res) => {
     room.claimRequestName = '';
     room.claimRequestedAt = null;
     await room.save();
+    await logAudit(req, { action: 'room.claim.reject', targetType: 'room', targetId: room._id });
     res.json({ success: true, message: 'Claim request reject kar di.' });
   } catch (error) { serverError(res, error, 'Claim reject error'); }
 });
@@ -196,7 +211,7 @@ router.post('/admin/claims/:id/reject', requireAdmin, async (req, res) => {
 // userId/ownerName token se aate hain (client-spoofing band).
 // isPromoted client se NAHI liya jaata — promo sirf admin approve ke baad lagta hai.
 // paymentCode server generate karta hai (client ka random code nahi).
-router.post('/', requireAuth, upload.array('images', 6), async (req, res) => {
+router.post('/', requireAuth, upload.array('images', 6), sanitizeMultipart, async (req, res) => {
   // P1 #21 tracking: save fail hone par upload hui photos orphan na rahein
   let uploadedThisRequest = [];
   let savedOk = false;
@@ -214,10 +229,16 @@ router.post('/', requireAuth, upload.array('images', 6), async (req, res) => {
     if (!title || !price || !category || (!isService && !type)) {
       return res.status(400).json({ success: false, message: isService ? 'Service ka naam, Price aur Category zaroori hain.' : 'Title, Price, Type aur Category zaroori hain.' });
     }
-    const cleanCategory = String(category).trim().slice(0, 60);
+    const cleanTitle = cleanText(title, 120);
+    if (cleanTitle.length < 3) {
+      return res.status(400).json({ success: false, message: 'Title 3-120 characters ka ho.' });
+    }
+    const cleanCategory = cleanText(category, 60);
     if (cleanCategory.length < 2) {
       return res.status(400).json({ success: false, message: 'Sahi category chunein.' });
     }
+    const cleanLandmark = cleanText(landmark, 160);
+    const cleanDescription = cleanText(description, 2000);
     const cleanAudience = isService ? 'Service' : cleanType(type);
     if (!cleanAudience) {
       return res.status(400).json({ success: false, message: 'Audience (Boys/Girls/Family/Anyone) sahi chuno.' });
@@ -265,6 +286,16 @@ router.post('/', requireAuth, upload.array('images', 6), async (req, res) => {
       ? Math.min(100000, Math.floor(rawServiceRate))
       : 0;
     const serviceFee = isService ? serviceDailyRate * serviceDays : 0;
+    const bannerWanted = bannerRequested === 'true' || bannerRequested === true;
+    const regularFee = requestedPlan === 'regular' ? moneyNum(appSettings && appSettings.pricing && appSettings.pricing.regular) : 0;
+    const promoFee = requestedPlan === 'regular' ? 0 : moneyNum(appSettings && appSettings.pricing && appSettings.pricing[`promo${requestedPlan}`]);
+    const bannerFee = bannerWanted ? moneyNum(appSettings && appSettings.pricing && appSettings.pricing.bannerPrice) : 0;
+    const paidTotal = serviceFee + regularFee + promoFee + bannerFee;
+    const cleanPaymentRef = cleanText(paymentRef, 64);
+    // UTR/UPI ref ke bina paid ad accept nahi — empty field par payment window se aage nahi.
+    if (paidTotal > 0 && cleanPaymentRef.replace(/\s/g, '').length < 6) {
+      return res.status(400).json({ success: false, message: 'Payment ke baad UPI Ref / UTR number daalna zaroori hai (min 6 characters).' });
+    }
 
     let ownerName = 'Owner';
     if (req.user.role !== 'admin') {
@@ -280,28 +311,28 @@ router.post('/', requireAuth, upload.array('images', 6), async (req, res) => {
       const uploaded = await Promise.all(
         req.files.slice(0, 6).map((f) => upload.uploadBufferToCloudinary(f))
       );
-      uploadedThisRequest = uploaded.map((u) => u.secure_url).filter(Boolean);
+      uploadedThisRequest = uploaded.map((u) => u.secure_url).filter(isCloudinaryUrl);
       imageUrls = uploadedThisRequest;
     }
 
     const newRoom = new Room({
-      title: String(title).trim().slice(0, 120),
+      title: cleanTitle,
       listingType: isService ? 'service' : 'room',
       price: cleanPriceVal,
       type: cleanAudience,
       category: cleanCategory,
-      landmark: String(landmark || '').trim(),
+      landmark: cleanLandmark,
       mobile: cleanPhone,
-      description: String(description || '').trim(),
+      description: cleanDescription,
       lng: cleanLng,
       lat: cleanLat,
       isPromoted: false, // Hamesha false — admin approve karega (C6)
       promoPlan: 'regular',
       promoRequested: requestedPlan,
-      paymentRef: String(paymentRef || '').trim().slice(0, 64),
+      paymentRef: cleanPaymentRef,
       // 🎯 Banner add-on request (activate sirf admin karega)
-      bannerRequested: bannerRequested === 'true' || bannerRequested === true,
-      bannerRef: String(bannerRef || paymentRef || '').trim().slice(0, 64),
+      bannerRequested: bannerWanted,
+      bannerRef: cleanText(bannerRef || cleanPaymentRef || '', 64),
       isBannerActive: false,
       // 🧾 Service listing duration + admin rate snapshot (approval par expiry set hogi)
       serviceDays,
@@ -319,7 +350,7 @@ router.post('/', requireAuth, upload.array('images', 6), async (req, res) => {
 
     // 🟢 Auto-approve: sirf FREE/regular ads, aur sirf jab admin ne toggle ON kiya ho.
     // Promo/banner wale HAMESHA pending (payment verify hoga).
-    const wantsPaid = requestedPlan !== 'regular' || newRoom.bannerRequested || serviceFee > 0;
+    const wantsPaid = paidTotal > 0 || requestedPlan !== 'regular' || bannerWanted || serviceFee > 0;
     if (!wantsPaid && !isService) {
       if (appSettings && appSettings.autoApproveFree) newRoom.isApproved = true;
     }
@@ -357,7 +388,7 @@ router.get('/', async (req, res) => {
         { serviceExpiresAt: { $gte: now } }
       ]
     })
-      .select('-reportedBy -userId -paymentRef -paymentCode -bannerRef -viewKeys -mobile') // P2-4 + mobile private (reveal API se)
+      .select(PUBLIC_ROOM_EXCLUDE)
       .sort({ createdAt: -1 }).limit(1000).lean();
     res.status(200).json({ success: true, count: rooms.length, rooms });
   } catch (error) { serverError(res, error, 'Live-rooms error'); }
@@ -375,7 +406,7 @@ router.get('/banners', async (req, res) => {
         { isBannerActive: true, $or: [{ bannerExpires: null }, { bannerExpires: { $gte: now } }] },
         { listingType: 'service', $or: [{ serviceExpiresAt: null }, { serviceExpiresAt: { $gte: now } }] }
       ]
-    }).select('-reportedBy -userId -paymentRef -paymentCode -bannerRef -viewKeys -mobile').sort({ createdAt: -1 }).limit(50).lean(); // P1 #19 (top strip chhota hota hai)
+    }).select(PUBLIC_ROOM_EXCLUDE).sort({ createdAt: -1 }).limit(50).lean(); // P1 #19 (top strip chhota hota hai)
     res.json({ success: true, count: rooms.length, rooms });
   } catch (error) { serverError(res, error, 'Banners error'); }
 });
@@ -383,6 +414,7 @@ router.get('/banners', async (req, res) => {
 // 📞 P1: number-reveal usage — user ko pata rahe daily limit me kitne bache hain
 router.get('/contact-usage', requireAuth, async (req, res) => {
   try {
+    res.set('Cache-Control', 'no-store');
     const settings = await Settings.findOne({ key: 'app_settings' }).lean();
     const limit = revealLimit(settings);
     const used = await ContactReveal.countDocuments({ userId: req.user.id, date: istDateKey() });
@@ -393,6 +425,7 @@ router.get('/contact-usage', requireAuth, async (req, res) => {
 // 📞 P1: logged-in user number reveal kare (daily limit + same ad dobara kholna free)
 router.get('/:id/contact', requireAuth, async (req, res) => {
   try {
+    res.set('Cache-Control', 'no-store');
     const room = await Room.findById(req.params.id).select('mobile isApproved isActive userId listingType serviceExpiresAt').lean();
     if (!room || !room.mobile) {
       return res.status(404).json({ success: false, message: 'Is ad ka number available nahi hai.' });
@@ -449,6 +482,7 @@ router.patch('/:id/banner', requireAdmin, async (req, res) => {
       room.bannerExpires = null;
     }
     await room.save();
+    await logAudit(req, { action: approve ? 'room.banner.approve' : 'room.banner.revoke', targetType: 'room', targetId: room._id });
     res.json({ success: true, message: approve ? 'Banner live ho gaya!' : 'Banner hata diya gaya.', room });
   } catch (error) { serverError(res, error, 'Banner error'); }
 });
@@ -456,6 +490,10 @@ router.patch('/:id/banner', requireAdmin, async (req, res) => {
 // User Dashboard Ads (SELF OR ADMIN — H1 fix, pehle koi bhi kisi ka dekh sakta tha)
 router.get('/user/:userId', requireAuth, async (req, res) => {
   try {
+    res.set('Cache-Control', 'no-store');
+    if (!mongoose.isValidObjectId(req.params.userId)) {
+      return res.status(404).json({ success: false, message: 'User nahi mila.' });
+    }
     if (req.user.role !== 'admin' && req.params.userId !== req.user.id) {
       return res.status(403).json({ success: false, message: 'Access Denied!' });
     }
@@ -480,7 +518,7 @@ router.patch('/:id/toggle-status', requireAuth, async (req, res) => {
 
 // SMART EDIT ROUTE (OWNER OR ADMIN — C1 fix; edit = dobara pending)
 // NOTE: auth check multer se PEHLE hai taaki bina-login upload na ho.
-router.put('/:id/edit', requireAuth, upload.array('images', 6), async (req, res) => {
+router.put('/:id/edit', requireAuth, upload.array('images', 6), sanitizeMultipart, async (req, res) => {
   // P1 #21 tracking: edit fail hone par nayi upload hui photos orphan na rahein
   let uploadedThisRequest = [];
   let savedOk = false;
@@ -492,7 +530,11 @@ router.put('/:id/edit', requireAuth, upload.array('images', 6), async (req, res)
     }
 
     const isServiceListing = room.listingType === 'service';
-    if (req.body.title) room.title = String(req.body.title).trim().slice(0, 120);
+    if (req.body.title !== undefined) {
+      const cleanTitle = cleanText(req.body.title, 120);
+      if (cleanTitle.length < 3) return res.status(400).json({ success: false, message: 'Title 3-120 characters ka ho.' });
+      room.title = cleanTitle;
+    }
     if (req.body.price) {
       const cleanPriceVal = cleanPrice(req.body.price); // P1 #24
       if (!cleanPriceVal) return res.status(400).json({ success: false, message: 'Price sirf number hona chahiye (jaise 3000).' });
@@ -503,14 +545,18 @@ router.put('/:id/edit', requireAuth, upload.array('images', 6), async (req, res)
       if (!cleanAudience) return res.status(400).json({ success: false, message: 'Audience (Boys/Girls/Family/Anyone) sahi chuno.' });
       room.type = cleanAudience;
     }
-    if (req.body.category) room.category = String(req.body.category).trim();
-    if (req.body.landmark !== undefined) room.landmark = String(req.body.landmark).trim();
+    if (req.body.category !== undefined) {
+      const cleanCategory = cleanText(req.body.category, 60);
+      if (cleanCategory.length < 2) return res.status(400).json({ success: false, message: 'Sahi category chunein.' });
+      room.category = cleanCategory;
+    }
+    if (req.body.landmark !== undefined) room.landmark = cleanText(req.body.landmark, 160);
     if (req.body.mobile) {
       const cleanPhone = cleanMobile(req.body.mobile);
       if (!cleanPhone) return res.status(400).json({ success: false, message: 'Sahi 10-digit mobile number daliye.' });
       room.mobile = cleanPhone;
     }
-    if (req.body.description !== undefined) room.description = String(req.body.description).trim();
+    if (req.body.description !== undefined) room.description = cleanText(req.body.description, 2000);
     // 📍 Landmarks dobara select kiye hon toh replace (bheje hi nahi toh puraane safe)
     if (req.body.landmarks !== undefined) room.landmarks = cleanLandmarks(req.body.landmarks);
 
@@ -556,10 +602,10 @@ router.put('/:id/edit', requireAuth, upload.array('images', 6), async (req, res)
       const uploaded = await Promise.all(
         req.files.slice(0, 6).map((f) => upload.uploadBufferToCloudinary(f))
       );
-      uploadedThisRequest = uploaded.map((u) => u.secure_url).filter(Boolean);
+      uploadedThisRequest = uploaded.map((u) => u.secure_url).filter(isCloudinaryUrl);
       newUrls = uploadedThisRequest;
     }
-    const finalGallery = [...keepList, ...newUrls].slice(0, 6);
+    const finalGallery = [...keepList.filter(isCloudinaryUrl), ...newUrls].slice(0, 6);
     // P1 #21: jo purani photos is edit me hata di gayi, wo Cloudinary par orphan na rahein
     const removedUrls = currentGallery.filter((u) => !finalGallery.includes(u));
     room.images = finalGallery;
@@ -621,6 +667,7 @@ router.patch('/:id/approve', requireAdmin, async (req, res) => {
     }
 
     await room.save();
+    await logAudit(req, { action: 'room.approve', targetType: 'room', targetId: room._id });
     res.status(200).json({ success: true, message: room.listingType === 'service' ? 'Service listing approved!' : 'Room Approved!', room });
   } catch (error) { serverError(res, error, 'Approve error'); }
 });
@@ -639,8 +686,12 @@ router.post('/:id/renew', requireAuth, async (req, res) => {
     if (!['7', '15', '30'].includes(promoPlan)) {
       return res.status(400).json({ success: false, message: 'Plan 7, 15 ya 30 din ka chuno.' });
     }
+    const renewRef = cleanText(paymentRef, 64);
+    if (renewRef.replace(/\s/g, '').length < 6) {
+      return res.status(400).json({ success: false, message: 'Payment ke baad UPI Ref / UTR number daalna zaroori hai (min 6 characters).' });
+    }
     room.promoRequested = promoPlan;
-    room.paymentRef = String(paymentRef || '').trim().slice(0, 64);
+    room.paymentRef = renewRef;
     room.paymentCode = cleanPayCode(paymentCode) || newPayCode();
     room.isApproved = false; // Dobara admin verification (payment check)
     await room.save();
@@ -653,6 +704,7 @@ router.post('/:id/renew', requireAuth, async (req, res) => {
 // match hone par sirf claim REQUEST banti hai, final link ADMIN approve karta hai.
 router.get('/claimable', requireAuth, async (req, res) => {
   try {
+    res.set('Cache-Control', 'no-store');
     const clean = cleanMobile(req.query.mobile);
     if (!clean) return res.status(400).json({ success: false, message: 'Sahi 10-digit mobile number daliye.' });
     const candidates = await Room.find({ isActive: true })
@@ -741,15 +793,16 @@ router.put('/:id/report-unavailable', requireAuth, async (req, res) => {
 });
 
 // --- AD VIEW COUNTER (public, D1) — server-side dedupe (IP+din), fail silent (UX na toote)
-router.put('/:id/view', async (req, res) => {
+router.put('/:id/view', viewLimiter, async (req, res) => {
   try {
     const day = new Date().toISOString().slice(0, 10);
     const viewKey = crypto.createHash('sha1').update(`${req.ip || 'unknown'}|${day}`).digest('hex').slice(0, 24);
-    await Room.findOneAndUpdate(
-      { _id: req.params.id, viewKeys: { $ne: viewKey } },
-      { $push: { viewKeys: { $each: [viewKey], $slice: -3000 } }, $inc: { views: 1 } }
+    const updated = await Room.findOneAndUpdate(
+      { _id: req.params.id, isApproved: true, isActive: true, viewKeys: { $ne: viewKey } },
+      { $push: { viewKeys: { $each: [viewKey], $slice: -3000 } }, $inc: { views: 1 } },
+      { projection: { _id: 1 } }
     );
-    res.json({ success: true });
+    res.json({ success: Boolean(updated) });
   } catch { res.json({ success: false }); }
 });
 
@@ -761,10 +814,25 @@ router.delete('/:id', requireAuth, async (req, res) => {
     if (!canModify(room, req.user)) {
       return res.status(403).json({ success: false, message: 'Access Denied! Ye ad aapka nahi hai.' });
     }
+    // Data-loss safeguard: pehle snapshot archive karo, archive fail ho toh delete abort.
+    const archived = await archiveRooms(room.toObject(), {
+      deletedBy: req.user.id,
+      deletedByRole: req.user.role === 'admin' ? 'admin' : 'user',
+      reason: 'room delete'
+    });
+    if (archived !== 1) {
+      return res.status(503).json({ success: false, message: 'Delete abhi safe nahi hai. Thodi der baad try karein.' });
+    }
     await Room.findByIdAndDelete(req.params.id);
     // P1 #21: ad delete par uski saari photos Cloudinary se bhi hatao (bounded, best-effort)
     const galleryToDelete = [...(room.images || []), room.image].filter(Boolean);
     await upload.destroyByUrls(galleryToDelete).catch(() => {});
+    await logAudit(req, {
+      action: 'room.delete',
+      targetType: 'room',
+      targetId: room._id,
+      details: { title: room.title, listingType: room.listingType }
+    });
     res.status(200).json({ success: true, message: 'Room Deleted!' });
   } catch (error) { serverError(res, error, 'Delete error'); }
 });

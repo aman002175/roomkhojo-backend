@@ -12,6 +12,8 @@ const ActionOtp = require('../models/ActionOtp');
 const SignupRequest = require('../models/SignupRequest');
 const ConsentLog = require('../models/ConsentLog');
 const { signAdmin, requireAdmin } = require('../middleware/auth');
+const { cleanText, passwordProblem } = require('../utils/security');
+const { logAudit, archiveRooms } = require('../utils/audit');
 
 // Login par brute-force protection: 15 min me max 10 attempts (H4)
 // 🚦 Upstash Redis env set hone par shared store (serverless-safe)
@@ -19,6 +21,11 @@ const loginLimiter = createLimiter('admin-login', {
   windowMs: 15 * 60 * 1000,
   max: 10,
   message: { success: false, message: 'Bahut zyada login attempts. 15 minute baad try karein.' }
+});
+
+router.use((req, res, next) => {
+  res.set('Cache-Control', 'no-store');
+  next();
 });
 
 // --- Default Admin Seed (SAFE VERSION — C3 fix) ---
@@ -31,6 +38,8 @@ const loginLimiter = createLimiter('admin-login', {
 const seedAdmin = async () => {
   try {
     const forceReset = process.env.ADMIN_FORCE_RESET === 'true';
+    const configuredPassword = process.env.ADMIN_INITIAL_PASSWORD;
+    const isProd = process.env.NODE_ENV === 'production' || Boolean(process.env.VERCEL);
     const count = await Admin.countDocuments();
     if (count > 0 && !forceReset) return; // Pehle se admin hai → kuch mat karo
     if (forceReset) {
@@ -39,19 +48,32 @@ const seedAdmin = async () => {
         console.log('⚠️ ADMIN_FORCE_RESET skip — ye recovery pehle hi use ho chuki hai. Dobara chahiye toh DB me settings.forceResetAt = null karein.');
         return;
       }
-      await Admin.deleteMany({});
+      if (!configuredPassword) {
+        console.error('❌ ADMIN_FORCE_RESET ke liye ADMIN_INITIAL_PASSWORD zaroori hai — admins delete nahi kiye.');
+        return;
+      }
     }
-    const initialPassword = process.env.ADMIN_INITIAL_PASSWORD || crypto.randomBytes(12).toString('hex');
+    if (!configuredPassword && isProd) {
+      console.error('❌ ADMIN_INITIAL_PASSWORD set nahi hai — production me admin seed nahi banega.');
+      return;
+    }
+    const initialPassword = configuredPassword || crypto.randomBytes(12).toString('hex');
+    const seedPasswordProblem = passwordProblem(initialPassword, 8);
+    if (seedPasswordProblem) {
+      console.error(`❌ Admin seed password weak hai: ${seedProblem}`);
+      return;
+    }
+    if (forceReset) await Admin.deleteMany({});
     await Admin.create({
-      username: process.env.ADMIN_INITIAL_USERNAME || 'admin',
+      username: cleanText(process.env.ADMIN_INITIAL_USERNAME || 'admin', 60) || 'admin',
       password: initialPassword // Model hook ise hash karke save karega
     });
     if (forceReset) {
       await Settings.findOneAndUpdate({ key: 'app_settings' }, { forceResetAt: new Date() }, { upsert: true });
     }
-    console.log('✅ Default admin account banaya gaya (username: admin).');
-    if (!process.env.ADMIN_INITIAL_PASSWORD) {
-      console.log(`🔑 Generated admin password (login karke turant badal lena): ${initialPassword}`);
+    console.log('✅ Default admin account seed ho gaya.');
+    if (!configuredPassword) {
+      console.log('🔑 Dev admin password generated tha — ise terminal se copy karke turant badlein.');
     }
   } catch (error) {
     console.log('⚠️ Admin Seed Failed:', error.message);
@@ -65,15 +87,41 @@ if (mongoose.connection.readyState === 1) {
 }
 
 // --- Admin Login API (bcrypt + JWT — C4/C5 fix) ---
+const MAX_LOGIN_FAILURES = 5;
+const LOGIN_LOCK_MS = 15 * 60 * 1000;
+
 router.post('/login', loginLimiter, async (req, res) => {
   try {
-    const { username, password } = req.body || {};
-    if (!username || !password) {
+    res.set('Cache-Control', 'no-store');
+    const username = cleanText(req.body && req.body.username, 60);
+    const password = req.body && req.body.password;
+    if (!username || typeof password !== 'string') {
       return res.status(400).json({ success: false, message: 'Username aur password dono zaroori hain.' });
     }
+    if (password.length > 200) {
+      return res.status(400).json({ success: false, message: 'Username ya Password galat hai!' });
+    }
     const admin = await Admin.findOne({ username });
-    if (!admin || !(await admin.comparePassword(password))) {
+    if (!admin) {
       return res.status(401).json({ success: false, message: 'Username ya Password galat hai!' });
+    }
+    if (admin.lockedUntil && admin.lockedUntil > new Date()) {
+      return res.status(429).json({ success: false, message: 'Bahut zyada galat attempts. 15 minute baad try karein.' });
+    }
+    if (!(await admin.comparePassword(password))) {
+      admin.failedLoginAttempts = (admin.failedLoginAttempts || 0) + 1;
+      if (admin.failedLoginAttempts >= MAX_LOGIN_FAILURES) {
+        admin.lockedUntil = new Date(Date.now() + LOGIN_LOCK_MS);
+        admin.failedLoginAttempts = 0;
+      }
+      await admin.save();
+      await logAudit(req, { action: 'admin.login_failed', targetType: 'admin', targetId: admin._id, actorId: admin._id, actorRole: 'system' });
+      return res.status(401).json({ success: false, message: 'Username ya Password galat hai!' });
+    }
+    if (admin.failedLoginAttempts || admin.lockedUntil) {
+      admin.failedLoginAttempts = 0;
+      admin.lockedUntil = null;
+      await admin.save();
     }
     const token = signAdmin(admin);
     res.json({ success: true, message: 'Login successful', token });
@@ -87,15 +135,47 @@ router.post('/login', loginLimiter, async (req, res) => {
 // Puraana password bcrypt se verify hota hai, sirf logged-in admin badal sakta hai.
 router.post('/change-credentials', requireAdmin, async (req, res) => {
   try {
-    const { oldPassword, newUsername, newPassword } = req.body || {};
+    res.set('Cache-Control', 'no-store');
+    const body = req.body || {};
+    const oldPassword = typeof body.oldPassword === 'string' ? body.oldPassword : '';
+    const newPassword = body.newPassword === undefined ? '' : body.newPassword;
+    const newUsername = body.newUsername === undefined ? '' : body.newUsername;
+    if (!oldPassword) {
+      return res.status(400).json({ success: false, message: 'Purana password zaroori hai.' });
+    }
+    if (!newUsername && !newPassword) {
+      return res.status(400).json({ success: false, message: 'Naya username ya password me se kuch dijiye.' });
+    }
     const admin = await Admin.findById(req.user.id);
     if (!admin || !(await admin.comparePassword(oldPassword))) {
       return res.status(401).json({ success: false, message: 'Purana password galat hai!' });
     }
-    if (newUsername) admin.username = newUsername;
-    if (newPassword) admin.password = newPassword; // Model hook hash karega
+    if (newUsername !== '') {
+      const cleanedUser = cleanText(newUsername, 40);
+      if (!/^[A-Za-z0-9._-]{3,40}$/.test(cleanedUser)) {
+        return res.status(400).json({ success: false, message: 'Username 3-40 characters ka ho (a-z, 0-9, ., -, _).' });
+      }
+      const taken = await Admin.findOne({ username: cleanedUser, _id: { $ne: admin._id } }).select('_id').lean();
+      if (taken) {
+        return res.status(409).json({ success: false, message: 'Ye username pehle se use ho raha hai.' });
+      }
+      admin.username = cleanedUser;
+    }
+    if (newPassword !== '') {
+      const pwProblem = passwordProblem(newPassword, 12);
+      if (pwProblem) return res.status(400).json({ success: false, message: pwProblem });
+      if (newPassword === oldPassword) {
+        return res.status(400).json({ success: false, message: 'Naya password purane se alag hona chahiye.' });
+      }
+      admin.password = newPassword;
+    }
+    admin.tokenVersion = (admin.tokenVersion || 0) + 1;
+    admin.failedLoginAttempts = 0;
+    admin.lockedUntil = null;
     await admin.save();
-    res.json({ success: true, message: 'Credentials successfully updated!' });
+    await logAudit(req, { action: 'admin.credentials_changed', targetType: 'admin', targetId: admin._id });
+    const token = signAdmin(admin);
+    res.json({ success: true, message: 'Credentials successfully updated!', token });
   } catch (error) {
     console.error('Change-credentials error:', error.message);
     res.status(500).json({ success: false, message: 'Server me gadbad hai. Baad me try karein.' });
@@ -112,11 +192,19 @@ const seedSettings = async () => {
 if (mongoose.connection.readyState === 1) seedSettings();
 else mongoose.connection.once('open', seedSettings);
 
+const publicSettings = (raw) => {
+  if (!raw) return null;
+  const settings = raw.toObject ? raw.toObject() : raw;
+  const { forceResetAt, __v, ...safe } = settings;
+  return safe;
+};
+
 // --- Get App Settings API (public — categories/facilities sabko chahiye) ---
 router.get('/settings', async (req, res) => {
   try {
-    const settings = await Settings.findOne({ key: 'app_settings' });
-    res.json({ success: true, settings });
+    const settings = await Settings.findOne({ key: 'app_settings' }).lean();
+    res.set('Cache-Control', 'public, max-age=300');
+    res.json({ success: true, settings: publicSettings(settings) });
   } catch (error) {
     console.error('Get settings error:', error.message);
     res.status(500).json({ success: false, message: 'Server me gadbad hai. Baad me try karein.' });
@@ -136,23 +224,70 @@ const cleanAdminPath = (raw) => {
   return p;
 };
 
+const cleanStringList = (value, maxItems, maxLen) => {
+  if (!Array.isArray(value) || value.length > maxItems) return null;
+  const out = [];
+  for (const item of value) {
+    if (typeof item !== 'string') return null;
+    const clean = cleanText(item, maxLen);
+    if (!clean) continue;
+    if (!out.includes(clean)) out.push(clean);
+  }
+  return out;
+};
+
+const cleanMoney = (value, max = 100000) => {
+  if (typeof value !== 'string' && typeof value !== 'number') return null;
+  const n = Number(String(value).replace(/[^\d.]/g, ''));
+  if (!Number.isFinite(n) || n < 0 || n > max) return null;
+  return String(Math.round(n));
+};
+
+const cleanPricing = (pricing) => {
+  if (!pricing || typeof pricing !== 'object' || Array.isArray(pricing)) return null;
+  const out = {};
+  for (const key of ['regular', 'promo7', 'promo15', 'promo30', 'bannerPrice', 'serviceDailyRate']) {
+    if (pricing[key] === undefined) continue;
+    const value = cleanMoney(pricing[key]);
+    if (value === null) return null;
+    out[key] = value;
+  }
+  if (pricing.bannerDays !== undefined) {
+    const days = Number(pricing.bannerDays);
+    if (!Number.isInteger(days) || days < 1 || days > 365) return null;
+    out.bannerDays = String(days);
+  }
+  if (pricing.upiId !== undefined) {
+    const upi = String(pricing.upiId || '').trim();
+    if (!/^[A-Za-z0-9._-]{2,64}@[A-Za-z]{2,32}$/.test(upi)) return null;
+    out.upiId = upi;
+  }
+  for (const key of Object.keys(pricing)) {
+    if (!['regular', 'promo7', 'promo15', 'promo30', 'bannerPrice', 'bannerDays', 'serviceDailyRate', 'upiId'].includes(key)) return null;
+  }
+  return out;
+};
+
 router.post('/settings', requireAdmin, async (req, res) => {
   try {
     const { categories, facilities, pricing, adminPath, autoApproveFree, contactRevealLimit } = req.body || {};
 
     const update = {};
-    if (categories !== undefined) update.categories = categories;
-    if (facilities !== undefined) update.facilities = facilities;
+    if (categories !== undefined) {
+      const clean = cleanStringList(categories, 20, 40);
+      if (!clean) return res.status(400).json({ success: false, message: 'Categories list sahi nahi hai (max 20, har item 40 chars).' });
+      update.categories = clean;
+    }
+    if (facilities !== undefined) {
+      const clean = cleanStringList(facilities, 30, 40);
+      if (!clean) return res.status(400).json({ success: false, message: 'Facilities list sahi nahi hai (max 30, har item 40 chars).' });
+      update.facilities = clean;
+    }
     if (pricing !== undefined) {
-      if (pricing && pricing.serviceDailyRate !== undefined) {
-        const serviceRate = Number(pricing.serviceDailyRate);
-        if (!Number.isInteger(serviceRate) || serviceRate < 0 || serviceRate > 100000) {
-          return res.status(400).json({ success: false, message: 'Service provider per-day rate 0 se 100000 ke beech honi chahiye.' });
-        }
-        update.pricing = { ...pricing, serviceDailyRate: String(serviceRate) };
-      } else {
-        update.pricing = pricing;
-      }
+      const clean = cleanPricing(pricing);
+      if (!clean) return res.status(400).json({ success: false, message: 'Pricing values sahi nahi hain.' });
+      const existing = await Settings.findOne({ key: 'app_settings' }).lean();
+      update.pricing = { ...((existing && existing.pricing) || {}), ...clean };
     }
     if (autoApproveFree !== undefined) update.autoApproveFree = autoApproveFree === true || autoApproveFree === 'true';
     if (contactRevealLimit !== undefined) {
@@ -173,10 +308,11 @@ router.post('/settings', requireAdmin, async (req, res) => {
     const settings = await Settings.findOneAndUpdate(
       { key: 'app_settings' },
       update,
-      { new: true, upsert: true }
+      { new: true, upsert: true, runValidators: true }
     );
+    await logAudit(req, { action: 'admin.settings_updated', targetType: 'settings', targetId: 'app_settings', details: { fields: Object.keys(update) } });
 
-    res.json({ success: true, message: 'Settings securely updated!', settings });
+    res.json({ success: true, message: 'Settings securely updated!', settings: publicSettings(settings) });
   } catch (error) {
     console.error('🔥 SETTINGS ERROR:', error.message);
     res.status(500).json({ success: false, message: 'Server me gadbad hai. Baad me try karein.' });
@@ -218,6 +354,7 @@ router.post('/migrate-rooms', requireAdmin, async (req, res) => {
       { userId: { $in: orphanIds } },
       { $set: { userId: user._id.toString() } }
     );
+    await logAudit(req, { action: 'admin.rooms_migrated', targetType: 'user', targetId: user._id, details: { migrated: result.modifiedCount } });
     res.json({ success: true, migrated: result.modifiedCount, message: `${result.modifiedCount} puraane ads ${user.email} se link ho gaye! Dashboard refresh karo.` });
   } catch (error) {
     console.error('Migrate error:', error.message);
@@ -391,7 +528,7 @@ router.patch('/users/:id/status', requireAdmin, async (req, res) => {
     if (!['active', 'suspended', 'banned'].includes(status)) {
       return res.status(400).json({ success: false, message: 'Status active, suspended ya banned hona chahiye.' });
     }
-    const reason = String((req.body || {}).reason || '').trim().slice(0, 200);
+    const reason = cleanText((req.body || {}).reason, 200);
     const user = await User.findById(req.params.id);
     if (!user) return res.status(404).json({ success: false, message: 'User nahi mila.' });
     user.status = status;
@@ -399,6 +536,7 @@ router.patch('/users/:id/status', requireAdmin, async (req, res) => {
     user.statusChangedAt = new Date();
     user.tokenVersion = (user.tokenVersion || 0) + 1;
     await user.save();
+    await logAudit(req, { action: 'admin.user_status', targetType: 'user', targetId: user._id, details: { status, reason } });
     const messages = {
       active: 'User account dobara activate ho gaya.',
       suspended: 'User account suspend ho gaya.',
@@ -422,7 +560,18 @@ router.delete('/users/:id', requireAdmin, async (req, res) => {
     }
     const user = await User.findById(req.params.id);
     if (!user) return res.status(404).json({ success: false, message: 'User nahi mila.' });
-    const rooms = await Room.find({ userId: user._id }).select('image images').lean();
+    const rooms = await Room.find({ userId: user._id }).limit(1001).lean();
+    if (rooms.length > 1000) {
+      return res.status(503).json({ success: false, message: 'User ke paas bahut zyada listings hain — bulk delete support se karein.' });
+    }
+    const archived = await archiveRooms(rooms, {
+      deletedBy: req.user.id,
+      deletedByRole: 'admin',
+      reason: `admin user delete: ${user.email}`
+    });
+    if (rooms.length > 0 && archived < rooms.length) {
+      return res.status(500).json({ success: false, message: 'Archive fail hua — delete safety ke liye rok diya.' });
+    }
     const urls = [];
     rooms.forEach((r) => {
       if (r.image && /^https?:\/\//.test(r.image)) urls.push(r.image);
@@ -443,6 +592,7 @@ router.delete('/users/:id', requireAdmin, async (req, res) => {
       const upload = require('../config/cloudinary');
       if (urls.length > 0) await upload.destroyByUrls(urls);
     } catch { /* images orphan maaf — account delete ho chuka */ }
+    await logAudit(req, { action: 'admin.user_deleted', targetType: 'user', targetId: user._id, details: { email: user.email, rooms: rooms.length } });
     res.json({ success: true, message: `${user.name} ka account aur ${rooms.length} listings delete ho gaye.` });
   } catch (error) {
     console.error('Admin user delete error:', error.message);

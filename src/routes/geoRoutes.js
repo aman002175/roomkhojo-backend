@@ -45,6 +45,7 @@ const upstreamFetch = async (url, opts = {}, timeoutMs = 10000) => {
 };
 
 const num = (v, min, max) => {
+  if (v === '' || v === null || v === undefined) return null;
   const n = Number(v);
   return Number.isFinite(n) && n >= min && n <= max ? n : null;
 };

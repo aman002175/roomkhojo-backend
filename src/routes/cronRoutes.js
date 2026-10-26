@@ -4,6 +4,7 @@ const Room = require('../models/Room');
 const ContactReveal = require('../models/ContactReveal');
 const SupportTicket = require('../models/SupportTicket');
 const ConsentLog = require('../models/ConsentLog');
+const { safeEqual } = require('../utils/security');
 
 const RETENTION_DAYS = 180;
 
@@ -18,7 +19,7 @@ const cronGuard = (req, res, { requireSecret = false } = {}) => {
       res.status(503).json({ success: false, message: 'Cron secret configure nahi hai.' });
       return false;
     }
-  } else if (req.headers.authorization !== `Bearer ${secret}`) {
+  } else if (!safeEqual(req.headers.authorization || '', `Bearer ${secret}`)) {
     res.status(401).json({ success: false, message: 'Unauthorized' });
     return false;
   }
