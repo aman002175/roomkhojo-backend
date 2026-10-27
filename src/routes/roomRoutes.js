@@ -516,7 +516,7 @@ router.patch('/:id/toggle-status', requireAuth, async (req, res) => {
   } catch (error) { serverError(res, error, 'Toggle-status error'); }
 });
 
-// SMART EDIT ROUTE (OWNER OR ADMIN — C1 fix; edit = dobara pending)
+// SMART EDIT ROUTE (OWNER OR ADMIN — C1 fix; live ads live rehte hain)
 // NOTE: auth check multer se PEHLE hai taaki bina-login upload na ho.
 router.put('/:id/edit', requireAuth, upload.array('images', 6), sanitizeMultipart, async (req, res) => {
   // P1 #21 tracking: edit fail hone par nayi upload hui photos orphan na rahein
@@ -611,13 +611,16 @@ router.put('/:id/edit', requireAuth, upload.array('images', 6), sanitizeMultipar
     room.images = finalGallery;
     room.image = finalGallery[0] || '';
 
-    // 🚨 FRAUD PROTECTION: User ne edit kiya = Approve hategi aur Pending me jayega!
-    room.isApproved = false;
-
+    // Regular/owner edits live ad ko pending me nahi daalte. Approval status
+    // jaisa tha waisa hi rehta hai; paid/renew flows alag admin verification use karte hain.
     await room.save();
     savedOk = true;
     if (removedUrls.length > 0) await upload.destroyByUrls(removedUrls).catch(() => {}); // P1 #21
-    res.status(200).json({ success: true, message: 'Ad updated! Sent to Admin for verification.', room });
+    res.status(200).json({
+      success: true,
+      message: room.isApproved ? 'Ad updated and live!' : 'Ad updated! Admin verification pending.',
+      room
+    });
   } catch (error) {
     if (!savedOk && uploadedThisRequest.length > 0) {
       await upload.destroyByUrls(uploadedThisRequest).catch(() => {}); // P1 #21: save hua hi nahi

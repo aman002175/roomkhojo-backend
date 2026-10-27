@@ -32,6 +32,9 @@ const userSchema = new mongoose.Schema({
 // Password save hone se pehle hash hoga — plain password kabhi DB me nahi jayega
 userSchema.pre('save', async function () {
   if (!this.isModified('password') || !this.password) return;
+  // Signup OTP flow already gives us a bcrypt hash from SignupRequest —
+  // use it as-is instead of hashing the hash again.
+  if (this.$locals && this.$locals.passwordAlreadyHashed) return;
   const salt = await bcrypt.genSalt(10);
   this.password = await bcrypt.hash(this.password, salt);
 });

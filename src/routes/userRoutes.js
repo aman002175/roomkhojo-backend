@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const crypto = require('crypto');
+const bcrypt = require('bcryptjs');
 const { createLimiter } = require('../utils/rateStore'); // Upstash-ready (env na ho toh MemoryStore)
 const { OAuth2Client } = require('google-auth-library');
 const User = require('../models/User');
@@ -98,7 +99,8 @@ router.use((req, res, next) => {
 });
 
 // 1. Signup step-1: email OTP bhejo (account ab OTP verify hone par hi banta hai)
-// Password is request me validate hota hai par store NAHI hota — verify par dobara aata hai.
+// Password ka bcrypt hash yahan short-lived SignupRequest me rakha jaata hai,
+// taaki OTP full-page/reload ke baad bhi verify ho sake (plain password store nahi).
 router.post('/signup/request-otp', otpRequestLimiter, async (req, res) => {
   try {
     const body = req.body || {};
@@ -133,11 +135,13 @@ router.post('/signup/request-otp', otpRequestLimiter, async (req, res) => {
       return res.status(429).json({ success: false, message: 'Bahut zyada OTP requests. 15 minute baad try karein.' });
     }
     const otp = String(crypto.randomInt(100000, 999999));
+    const passwordHash = await bcrypt.hash(password, 10);
     await SignupRequest.findOneAndUpdate(
       { email: cleanEmail },
       {
         name: cleanName,
         phone: cleanNumber,
+        passwordHash,
         otpHash: hashOtp(otp),
         otpExpires: new Date(Date.now() + 10 * 60 * 1000),
         attempts: 0,
@@ -163,22 +167,67 @@ router.post('/signup/request-otp', otpRequestLimiter, async (req, res) => {
   }
 });
 
+// 1a. Signup OTP resend — full-page verify me password dobara nahi maangna padta.
+router.post('/signup/resend-otp', otpRequestLimiter, async (req, res) => {
+  try {
+    const cleanEmail = emailValue(req.body && req.body.email);
+    if (!cleanEmail || !isValidEmail(cleanEmail)) {
+      return res.status(400).json({ success: false, message: 'Sahi email address daliye.' });
+    }
+    if (await User.findOne({ email: cleanEmail })) {
+      return res.status(409).json({ success: false, message: 'Ye Email pehle se registered hai. Sign in karein.' });
+    }
+    const record = await SignupRequest.findOne({ email: cleanEmail });
+    if (!record || !record.passwordHash) {
+      return res.status(400).json({ success: false, message: 'Signup request nahi mili. Dobara signup shuru karein.' });
+    }
+
+    const now = new Date();
+    const inWindow = record.sendWindowStart && (now - record.sendWindowStart) < 15 * 60 * 1000;
+    if (inWindow && (record.sendCount || 0) >= 3) {
+      return res.status(429).json({ success: false, message: 'Bahut zyada OTP requests. 15 minute baad try karein.' });
+    }
+    const otp = String(crypto.randomInt(100000, 999999));
+    await SignupRequest.updateOne(
+      { _id: record._id },
+      {
+        $set: {
+          otpHash: hashOtp(otp),
+          otpExpires: new Date(Date.now() + 10 * 60 * 1000),
+          attempts: 0,
+          lastSentAt: now,
+          sendCount: inWindow ? (record.sendCount || 0) + 1 : 1,
+          sendWindowStart: inWindow ? record.sendWindowStart : now
+        }
+      }
+    );
+    try {
+      await sendOtpEmailFor(cleanEmail, otp, 'signup');
+    } catch (mailErr) {
+      if (mailErr.code === 'EMAIL_NOT_CONFIGURED') {
+        return res.status(503).json({ success: false, message: 'Email service abhi setup nahi hai. Admin se sampark karein.' });
+      }
+      console.error('Signup OTP resend failed:', mailErr.message);
+      return res.status(502).json({ success: false, message: 'OTP email bhejne me dikkat aayi. Thodi der baad try karein.' });
+    }
+    res.json({ success: true, message: 'Naya OTP aapke email par bhej diya gaya hai.', email: cleanEmail, maskedEmail: maskEmail(cleanEmail) });
+  } catch (error) {
+    console.error('Signup OTP resend error:', error.message);
+    res.status(500).json({ success: false, message: 'Server me gadbad hai. Baad me try karein.' });
+  }
+});
+
 // 1b. Signup step-2: OTP verify → account create + login token
 router.post('/signup/verify-otp', otpVerifyLimiter, async (req, res) => {
   try {
     const body = req.body || {};
     const cleanEmail = emailValue(body.email);
     const cleanOtp = otpValue(body.otp);
-    const password = body.password;
-    if (!cleanEmail || !cleanOtp || typeof password !== 'string') {
-      return res.status(400).json({ success: false, message: 'Email, OTP aur Password zaroori hain.' });
-    }
-    const pwError = passwordError(password);
-    if (pwError) {
-      return res.status(400).json({ success: false, message: pwError });
+    if (!cleanEmail || !cleanOtp) {
+      return res.status(400).json({ success: false, message: 'Email aur OTP dono zaroori hain.' });
     }
     const record = await SignupRequest.findOne({ email: cleanEmail });
-    if (!record || !record.otpHash || !record.otpExpires || record.otpExpires < new Date()) {
+    if (!record || !record.passwordHash || !record.otpHash || !record.otpExpires || record.otpExpires < new Date()) {
       return res.status(400).json({ success: false, message: 'OTP galat ya expire ho gaya hai. Naya OTP bhejein.' });
     }
     if ((record.attempts || 0) >= 5) {
@@ -192,14 +241,16 @@ router.post('/signup/verify-otp', otpVerifyLimiter, async (req, res) => {
       await SignupRequest.deleteOne({ email: cleanEmail });
       return res.status(409).json({ success: false, message: 'Ye Email pehle se registered hai. Sign in karein.' });
     }
-    const newUser = await User.create({
+    const newUser = new User({
       name: record.name,
       email: cleanEmail,
       phone: record.phone,
-      password,
       termsAcceptedAt: new Date(),
       termsVersion: TERMS_VERSION
     });
+    newUser.password = record.passwordHash;
+    newUser.$locals.passwordAlreadyHashed = true;
+    await newUser.save();
     ConsentLog.create({ emailHash: sha256(cleanEmail), termsVersion: TERMS_VERSION }).catch(() => {});
     await SignupRequest.deleteOne({ email: cleanEmail });
     const token = signUser(newUser);
