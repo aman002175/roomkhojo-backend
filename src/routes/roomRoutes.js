@@ -39,11 +39,17 @@ const newPayCode = () => 'RK-' + crypto.randomBytes(3).toString('hex').toUpperCa
 // (display sab jagah unchanged). Junk "abc"/"3000-5000" → null (400).
 // NOTE: DB me String hi (purane docs ke hydration-cast risk + FE price.replace compat).
 const cleanPrice = (raw) => {
-  const s = String(raw == null ? '' : raw).replace(/₹/g, '').replace(/,/g, '').trim();
-  if (!/^\d+(\.\d+)?$/.test(s)) return null;
-  const n = Number(s);
-  if (!Number.isFinite(n) || n < 1 || n > 9999999) return null;
-  return `₹${Math.round(n)}`;
+  const s0 = String(raw == null ? '' : raw).trim();
+  const s = s0.replace(/₹/g, '').replace(/,/g, '').trim();
+  if (/^\d+(\.\d+)?$/.test(s)) {
+    const n = Number(s);
+    if (!Number.isFinite(n) || n < 1 || n > 9999999) return null;
+    return `₹${Math.round(n)}`;
+  }
+  // 📝 Text price: "Contact for price" / "Negotiable" (3-40 chars, letters+punctuation).
+  //    Range-junk ("3000-5000") digit se shuru hota hai → reject.
+  if (/^[A-Za-z][A-Za-z .,'&/()-]{2,39}$/.test(s0)) return s0;
+  return null;
 };
 
 // Settings me prices String ("₹299" / "299") hain — fee comparison ke liye number.
@@ -247,9 +253,9 @@ router.post('/', requireAuth, upload.array('images', 6), sanitizeMultipart, asyn
     if (!cleanPhone) {
       return res.status(400).json({ success: false, message: 'Sahi 10-digit mobile number daliye.' });
     }
-    const cleanPriceVal = cleanPrice(price); // P1 #24: "abc" jaisa junk price reject
+    const cleanPriceVal = cleanPrice(price); // P1 #24: junk price reject (number ya allowed text)
     if (!cleanPriceVal) {
-      return res.status(400).json({ success: false, message: 'Price sirf number hona chahiye (jaise 3000).' });
+      return res.status(400).json({ success: false, message: 'Price number (jaise 3000) ya text (jaise "Contact for price") ho sakta hai.' });
     }
     // 🗺️ Optional Google Maps link — link me coords milen toh wahi use karo (zyada accurate)
     let mapLink = '';
@@ -540,7 +546,7 @@ router.put('/:id/edit', requireAuth, upload.array('images', 6), sanitizeMultipar
     }
     if (req.body.price) {
       const cleanPriceVal = cleanPrice(req.body.price); // P1 #24
-      if (!cleanPriceVal) return res.status(400).json({ success: false, message: 'Price sirf number hona chahiye (jaise 3000).' });
+      if (!cleanPriceVal) return res.status(400).json({ success: false, message: 'Price number (jaise 3000) ya text (jaise "Contact for price") ho sakta hai.' });
       room.price = cleanPriceVal;
     }
     if (req.body.type && !isServiceListing) {
@@ -558,6 +564,11 @@ router.put('/:id/edit', requireAuth, upload.array('images', 6), sanitizeMultipar
       const cleanPhone = cleanMobile(req.body.mobile);
       if (!cleanPhone) return res.status(400).json({ success: false, message: 'Sahi 10-digit mobile number daliye.' });
       room.mobile = cleanPhone;
+    }
+    // 👤 Owner name edit (listing par yahi naam dikhta hai) — 2-60 chars
+    if (req.body.ownerName !== undefined) {
+      const cleanName = cleanText(req.body.ownerName, 60);
+      if (cleanName.length >= 2) room.ownerName = cleanName;
     }
     if (req.body.description !== undefined) room.description = cleanText(req.body.description, 2000);
     // 📍 Landmarks dobara select kiye hon toh replace (bheje hi nahi toh puraane safe)
