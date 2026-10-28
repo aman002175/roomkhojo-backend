@@ -4,7 +4,7 @@ const settingSchema = new mongoose.Schema({
   // 👇 BHOOT KO BHAGANE WALI ASLI LINE (Ye sabse zaroori hai!)
   key: { type: String, default: 'app_settings' }, 
 
-  categories: { type: Array, default: ['PG', 'Flat', 'Hostel', 'Library', 'Office'] },
+  categories: { type: Array, default: ['PG', 'Flat', 'Room', 'Hostel', 'Library', 'Office'] },
   facilities: { type: Array, default: ['Wi-Fi', 'AC', 'Water 24x7', 'Electricity', 'Geyser', 'RO Water', 'Parking', 'CCTV', 'Meals', 'Attached Washroom'] },
   pricing: {
     regular: { type: String, default: '0' },

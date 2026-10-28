@@ -188,7 +188,15 @@ router.post('/change-credentials', requireAdmin, async (req, res) => {
 const seedSettings = async () => {
   try {
     const count = await Settings.countDocuments();
-    if (count === 0) await Settings.create({});
+    if (count === 0) { await Settings.create({}); return; }
+    // Migration: purane DB me 'Room' category missing ho toh add (Flat ke baad)
+    const cur = await Settings.findOne({ key: 'app_settings' }).select('categories').lean();
+    if (cur && Array.isArray(cur.categories) && !cur.categories.includes('Room')) {
+      await Settings.updateOne(
+        { key: 'app_settings', categories: { $ne: 'Room' } },
+        { $push: { categories: { $each: ['Room'], $position: 2 } } }
+      );
+    }
   } catch (err) { /* pehli baar DB na mile toh agli baar try hoga */ }
 };
 if (mongoose.connection.readyState === 1) seedSettings();
