@@ -221,6 +221,7 @@ router.post('/', requireAuth, upload.array('images', 6), sanitizeMultipart, asyn
   // P1 #21 tracking: save fail hone par upload hui photos orphan na rahein
   let uploadedThisRequest = [];
   let savedOk = false;
+  let idemKey = ''; // 🚫 double-submit key (catch me duplicate-race handle karne ke liye bhi chahiye)
   try {
     // P1-1 fix: per-user daily ad cap (10/din) — Cloudinary cost + spam abuse rok
     if (req.user.role !== 'admin') {
@@ -230,7 +231,7 @@ router.post('/', requireAuth, upload.array('images', 6), sanitizeMultipart, asyn
         return res.status(429).json({ success: false, message: 'Ek din me max 10 ads post kar sakte ho. 24 ghante baad dobara try karo.' });
       }
     }
-    const { title, price, type, category, landmark, mobile, description, lng, lat, promoPlan, paymentRef, paymentCode, bannerRequested, bannerRef, landmarks, googleMapUrl, listingType } = req.body || {};
+    const { title, price, type, category, landmark, mobile, description, lng, lat, promoPlan, paymentRef, paymentCode, bannerRequested, bannerRef, landmarks, googleMapUrl, listingType, idempotencyKey } = req.body || {};
     const isService = listingType === 'service';
     if (!title || !price || !category || (!isService && !type)) {
       return res.status(400).json({ success: false, message: isService ? 'Service ka naam, Price aur Category zaroori hain.' : 'Title, Price, Type aur Category zaroori hain.' });
@@ -242,6 +243,12 @@ router.post('/', requireAuth, upload.array('images', 6), sanitizeMultipart, asyn
     const cleanCategory = cleanText(category, 60);
     if (cleanCategory.length < 2) {
       return res.status(400).json({ success: false, message: 'Sahi category chunein.' });
+    }
+    // 🚫 P1 idempotency: same key dobara aaye toh naya ad mat banao — pehla wahi return
+    idemKey = cleanText(idempotencyKey, 64);
+    if (idemKey) {
+      const existing = await Room.findOne({ idempotencyKey: idemKey }).lean();
+      if (existing) return res.status(200).json({ success: true, duplicate: true, message: 'Ad pehle se ban gaya tha — wahi dikh raha hai.', room: existing });
     }
     const cleanLandmark = cleanText(landmark, 160);
     const cleanDescription = cleanText(description, 2000);
@@ -323,6 +330,7 @@ router.post('/', requireAuth, upload.array('images', 6), sanitizeMultipart, asyn
 
     const newRoom = new Room({
       title: cleanTitle,
+      idempotencyKey: idemKey || undefined, // 🚫 same key par duplicate insert → unique index 11000
       listingType: isService ? 'service' : 'room',
       price: cleanPriceVal,
       type: cleanAudience,
@@ -369,6 +377,12 @@ router.post('/', requireAuth, upload.array('images', 6), sanitizeMultipart, asyn
       : 'Ad submitted! Admin verification ke baad live hoga.';
     res.status(201).json({ success: true, message: liveMsg, room: savedRoom });
   } catch (error) {
+    // 🚫 Race: do parallel same-key requests — doosra duplicate-key (11000) de → pehla wahi ad return
+    if (error && error.code === 11000 && idemKey) {
+      if (uploadedThisRequest.length > 0) await upload.destroyByUrls(uploadedThisRequest).catch(() => {});
+      const existing = await Room.findOne({ idempotencyKey: idemKey }).lean().catch(() => null);
+      if (existing) return res.status(200).json({ success: true, duplicate: true, message: 'Ad pehle se ban gaya tha — wahi dikh raha hai.', room: existing });
+    }
     // P1 #21: ad save fail hui toh upload hui photos Cloudinary par orphan na rahein
     if (!savedOk && uploadedThisRequest.length > 0) {
       await upload.destroyByUrls(uploadedThisRequest).catch(() => {});
@@ -570,6 +584,8 @@ router.put('/:id/edit', requireAuth, upload.array('images', 6), sanitizeMultipar
       const cleanName = cleanText(req.body.ownerName, 60);
       if (cleanName.length >= 2) room.ownerName = cleanName;
     }
+    // ❌→⏳ reject ke baad owner ne edit kiya = dobara review ke liye (reason clear)
+    if (room.rejectReason) room.rejectReason = '';
     if (req.body.description !== undefined) room.description = cleanText(req.body.description, 2000);
     // 📍 Landmarks dobara select kiye hon toh replace (bheje hi nahi toh puraane safe)
     if (req.body.landmarks !== undefined) room.landmarks = cleanLandmarks(req.body.landmarks);
@@ -651,6 +667,7 @@ router.patch('/:id/approve', requireAdmin, async (req, res) => {
     const room = await Room.findById(req.params.id);
     if (!room) return res.status(404).json({ success: false, message: 'Room nahi mila.' });
     room.isApproved = true;
+    room.rejectReason = ''; // ❌→✅ approve karte hi purana reason hatao
     // 🎁 Checkbox: complimentary VIP (relative/friend) — premium milega par
     // earning dashboard me count NAHI hogi (paisa liya hi nahi).
     const complimentary = (req.body || {}).complimentary === true;
@@ -692,6 +709,22 @@ router.patch('/:id/approve', requireAdmin, async (req, res) => {
     await logAudit(req, { action: 'room.approve', targetType: 'room', targetId: room._id, details: { complimentary, promoPlan: room.promoPlan, paymentAmount: room.paymentAmount } });
     res.status(200).json({ success: true, message: room.listingType === 'service' ? 'Service listing approved!' : (complimentary ? 'Complimentary VIP approved! (earning me count nahi hoga)' : 'Room Approved!'), room });
   } catch (error) { serverError(res, error, 'Approve error'); }
+});
+
+// ❌ ADMIN REJECT — reason owner ko dashboard banner me dikhta hai; owner edit kare toh wapas pending
+router.patch('/:id/reject', requireAdmin, async (req, res) => {
+  try {
+    const room = await Room.findById(req.params.id);
+    if (!room) return res.status(404).json({ success: false, message: 'Room nahi mila.' });
+    const reason = cleanText((req.body || {}).reason, 200);
+    if (reason.length < 3) return res.status(400).json({ success: false, message: 'Reason 3-200 characters ka likhein (owner ko yahi dikhega).' });
+    room.isApproved = false;
+    room.isPromoted = false;
+    room.rejectReason = reason;
+    await room.save();
+    await logAudit(req, { action: 'room.reject', targetType: 'room', targetId: room._id, details: { reason } });
+    res.status(200).json({ success: true, message: 'Ad reject — owner ko reason ke saath dikhega.', room });
+  } catch (error) { serverError(res, error, 'Reject error'); }
 });
 
 // 🎁 Complimentary toggle — approve ke BAAD bhi admin kabhi bhi earning on/off kar sake

@@ -19,6 +19,10 @@ const roomSchema = new mongoose.Schema({
   isPromoted: { type: Boolean, default: false }, 
   isApproved: { type: Boolean, default: false }, 
   isActive: { type: Boolean, default: true },    
+  // ❌ Admin reject — reason owner ko dashboard par dikhta hai; owner edit kare toh clear (dobaara review)
+  rejectReason: { type: String, default: '' },
+  // 🚫 Double-submit protection — same key par dobara create nahi (unique sparse index neeche)
+  idempotencyKey: { type: String },
   
   owner: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
   userId: { type: String, default: 'unknown' },
@@ -82,5 +86,6 @@ roomSchema.index({ isPromoted: 1, expiryDate: 1 });              // promo expiry
 roomSchema.index({ isBannerActive: 1, bannerExpires: 1 });       // banner strip + cron
 roomSchema.index({ listingType: 1, isApproved: 1, createdAt: -1 }); // service listings
 roomSchema.index({ listingType: 1, serviceExpiresAt: 1 });         // service duration expiry
+roomSchema.index({ idempotencyKey: 1 }, { unique: true, sparse: true }); // 🚫 double-submit (key sirf naye ad par)
 
 module.exports = mongoose.model('Room', roomSchema);

@@ -17,7 +17,9 @@ const PUBLIC_ROOM_EXCLUDE = [
   '-claimRequestedAt',
   '-serviceDailyRate',
   '-serviceFee',
-  '-googleMapUrl'
+  '-googleMapUrl',
+  '-rejectReason',
+  '-idempotencyKey'
 ].join(' ');
 
 module.exports = { PUBLIC_ROOM_EXCLUDE };
