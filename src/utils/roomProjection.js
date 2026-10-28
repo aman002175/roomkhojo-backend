@@ -11,6 +11,7 @@ const PUBLIC_ROOM_EXCLUDE = [
   '-bannerRef',
   '-bannerAmount',
   '-paymentAmount',
+  '-complimentary',
   '-claimRequestedBy',
   '-claimRequestName',
   '-claimRequestedAt',

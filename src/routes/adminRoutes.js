@@ -370,11 +370,11 @@ router.post('/migrate-rooms', requireAdmin, async (req, res) => {
 router.get('/stats', requireAdmin, async (req, res) => {
   try {
     const rooms = await Room.find({})
-      .select('userId listingType isApproved isPromoted promoPlan promoRequested paymentAmount bannerAmount isBannerActive serviceExpiresAt createdAt')
+      .select('userId listingType isApproved isPromoted promoPlan promoRequested paymentAmount bannerAmount isBannerActive serviceExpiresAt complimentary createdAt')
       .lean();
     const acc = {
       totalAds: rooms.length, liveAds: 0, pendingAds: 0, expiredAds: 0, promoAds: 0, bannerActive: 0,
-      promoRevenue: 0, serviceRevenue: 0, bannerRevenue: 0,
+      promoRevenue: 0, serviceRevenue: 0, bannerRevenue: 0, complimentaryAds: 0,
       byPlan: { regular: 0, promo7: 0, promo15: 0, promo30: 0 },
       userIds: new Set()
     };
@@ -386,18 +386,23 @@ router.get('/stats', requireAdmin, async (req, res) => {
       else acc.expiredAds++;
       if (r.isPromoted) acc.promoAds++;
       if (r.isBannerActive) acc.bannerActive++;
-      const amt = Number(r.paymentAmount) || 0;
-      if (r.listingType === 'service') {
-        acc.serviceRevenue += amt;
+      // 🎁 Complimentary VIP (relative/friend): premium dikhta hai par earning nahi — skip
+      if (r.complimentary) {
+        acc.complimentaryAds++;
       } else {
-        acc.promoRevenue += amt;
-        if (r.promoPlan && ['7', '15', '30'].includes(String(r.promoPlan))) {
-          acc.byPlan[`promo${r.promoPlan}`] += amt;
-        } else if (r.isApproved) {
-          acc.byPlan.regular += amt;
+        const amt = Number(r.paymentAmount) || 0;
+        if (r.listingType === 'service') {
+          acc.serviceRevenue += amt;
+        } else {
+          acc.promoRevenue += amt;
+          if (r.promoPlan && ['7', '15', '30'].includes(String(r.promoPlan))) {
+            acc.byPlan[`promo${r.promoPlan}`] += amt;
+          } else if (r.isApproved) {
+            acc.byPlan.regular += amt;
+          }
         }
+        acc.bannerRevenue += Number(r.bannerAmount) || 0;
       }
-      acc.bannerRevenue += Number(r.bannerAmount) || 0;
       if (mongoose.Types.ObjectId.isValid(r.userId)) acc.userIds.add(String(r.userId));
     });
     const registeredUsers = await User.countDocuments();
@@ -416,6 +421,7 @@ router.get('/stats', requireAdmin, async (req, res) => {
         serviceRevenue: acc.serviceRevenue,
         bannerRevenue: acc.bannerRevenue,
         totalRevenue: acc.promoRevenue + acc.serviceRevenue + acc.bannerRevenue,
+        complimentaryAds: acc.complimentaryAds,
         byPlan: acc.byPlan
       }
     });

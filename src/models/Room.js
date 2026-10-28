@@ -36,6 +36,9 @@ const roomSchema = new mongoose.Schema({
   // 💰 #56: admin approve waqt record hui amount (stats asli revenue dikhaye)
   paymentAmount: { type: Number, default: 0 },
   bannerAmount: { type: Number, default: 0 },
+  // 🎁 Complimentary VIP (relative/friend listing): premium dikhta hai par
+  // paisa nahi liya — isliye iski earning dashboard stats me count NAHI hoti.
+  complimentary: { type: Boolean, default: false },
   // 📍 Aas-paas ke landmarks (user-selected): [{name, cat, lat, lng, distM}]
   // Student ko dikhta hai: "Coaching X (350m) • Bus Stand (800m)"
   landmarks: { type: [{ name: String, cat: String, lat: Number, lng: Number, distM: Number }], default: [] },

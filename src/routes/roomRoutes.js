@@ -640,13 +640,17 @@ router.patch('/:id/approve', requireAdmin, async (req, res) => {
     const room = await Room.findById(req.params.id);
     if (!room) return res.status(404).json({ success: false, message: 'Room nahi mila.' });
     room.isApproved = true;
+    // 🎁 Checkbox: complimentary VIP (relative/friend) — premium milega par
+    // earning dashboard me count NAHI hogi (paisa liya hi nahi).
+    const complimentary = (req.body || {}).complimentary === true;
+    room.complimentary = complimentary;
 
     // 💰 #56: payment verify hone par amount record karo (admin stats isi par based hai)
     const st = await Settings.findOne({ key: 'app_settings' });
     const pricing = (st && st.pricing) || {};
     if (room.listingType === 'service') {
       // Service fee submit-time snapshot hai — approve par amount dobara mat badlo.
-      room.paymentAmount = Number(room.serviceFee) || 0;
+      room.paymentAmount = complimentary ? 0 : Number(room.serviceFee) || 0;
       // Timer admin approval se shuru: provider ko review time ka loss nahi.
       if (!room.serviceExpiresAt && Number(room.serviceDays) > 0) {
         const start = new Date();
@@ -655,7 +659,7 @@ router.patch('/:id/approve', requireAdmin, async (req, res) => {
       }
     } else {
       const reqPlanKey = room.promoRequested && room.promoRequested !== 'regular' ? `promo${room.promoRequested}` : 'regular';
-      room.paymentAmount = Number(pricing[reqPlanKey] || 0) || 0;
+      room.paymentAmount = complimentary ? 0 : (Number(pricing[reqPlanKey] || 0) || 0);
     }
 
     if (room.listingType !== 'service' && room.promoRequested && room.promoRequested !== 'regular') {
@@ -674,9 +678,45 @@ router.patch('/:id/approve', requireAdmin, async (req, res) => {
     }
 
     await room.save();
-    await logAudit(req, { action: 'room.approve', targetType: 'room', targetId: room._id });
-    res.status(200).json({ success: true, message: room.listingType === 'service' ? 'Service listing approved!' : 'Room Approved!', room });
+    await logAudit(req, { action: 'room.approve', targetType: 'room', targetId: room._id, details: { complimentary, promoPlan: room.promoPlan, paymentAmount: room.paymentAmount } });
+    res.status(200).json({ success: true, message: room.listingType === 'service' ? 'Service listing approved!' : (complimentary ? 'Complimentary VIP approved! (earning me count nahi hoga)' : 'Room Approved!'), room });
   } catch (error) { serverError(res, error, 'Approve error'); }
+});
+
+// 🎁 Complimentary toggle — approve ke BAAD bhi admin kabhi bhi earning on/off kar sake
+// (relative tha / galti se count ho gaya — bina naye approve ke fix)
+router.patch('/:id/complimentary', requireAdmin, async (req, res) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) {
+      return res.status(404).json({ success: false, message: 'Room nahi mila.' });
+    }
+    const on = (req.body || {}).complimentary === true;
+    const room = await Room.findById(req.params.id);
+    if (!room) return res.status(404).json({ success: false, message: 'Room nahi mila.' });
+    room.complimentary = on;
+    if (on) {
+      // Earning hata do (promo/service dono)
+      room.paymentAmount = 0;
+    } else {
+      // Wapas earning me count: approve-jaisa amount dobara record
+      const st = await Settings.findOne({ key: 'app_settings' });
+      const pricing = (st && st.pricing) || {};
+      if (room.listingType === 'service') {
+        room.paymentAmount = Number(room.serviceFee) || 0;
+      } else {
+        const planKey = room.promoRequested && room.promoRequested !== 'regular' ? `promo${room.promoRequested}` : 'regular';
+        room.paymentAmount = Number(pricing[planKey] || 0) || 0;
+      }
+    }
+    await room.save();
+    await logAudit(req, { action: 'room.complimentary', targetType: 'room', targetId: room._id, details: { complimentary: on, paymentAmount: room.paymentAmount } });
+    res.json({
+      success: true,
+      complimentary: room.complimentary,
+      message: on ? 'Complimentary VIP ON — is ad ki earning ab count nahi hogi.' : `Complimentary OFF — earning ₹${room.paymentAmount} wapas count hogi.`,
+      room
+    });
+  } catch (error) { serverError(res, error, 'Complimentary error'); }
 });
 
 // --- RENEW PROMO PLAN (OWNER OR ADMIN) ---
