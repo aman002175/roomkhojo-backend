@@ -357,6 +357,7 @@ router.post('/', requireAuth, upload.array('images', 6), sanitizeMultipart, asyn
 
     const savedRoom = await newRoom.save();
     savedOk = true;
+    logAudit(req, { action: 'room.create', targetType: 'room', targetId: savedRoom._id, details: { title: savedRoom.title, listingType: savedRoom.listingType, isApproved: savedRoom.isApproved, promoRequested: savedRoom.promoRequested || 'regular', price: savedRoom.price } });
     const liveMsg = savedRoom.isApproved
       ? 'Ad live ho gaya!'
       : 'Ad submitted! Admin verification ke baad live hoga.';
@@ -426,7 +427,7 @@ router.get('/contact-usage', requireAuth, async (req, res) => {
 router.get('/:id/contact', requireAuth, async (req, res) => {
   try {
     res.set('Cache-Control', 'no-store');
-    const room = await Room.findById(req.params.id).select('mobile isApproved isActive userId listingType serviceExpiresAt').lean();
+    const room = await Room.findById(req.params.id).select('title mobile isApproved isActive userId listingType serviceExpiresAt').lean();
     if (!room || !room.mobile) {
       return res.status(404).json({ success: false, message: 'Is ad ka number available nahi hai.' });
     }
@@ -450,6 +451,7 @@ router.get('/:id/contact', requireAuth, async (req, res) => {
       }
       try {
         await ContactReveal.create({ userId: req.user.id, roomId: req.params.id, date });
+        logAudit(req, { action: 'contact.reveal', targetType: 'room', targetId: req.params.id, actorRole: 'user', details: { roomTitle: room.title || '', ownerUserId: String(room.userId || ''), date } });
       } catch { /* unique-race: pehle se revealed — count dobara nahi badhta */ }
     }
     const usedNow = await ContactReveal.countDocuments({ userId: req.user.id, date });
@@ -512,6 +514,7 @@ router.patch('/:id/toggle-status', requireAuth, async (req, res) => {
     }
     room.isActive = !room.isActive;
     await room.save();
+    logAudit(req, { action: 'room.toggle_status', targetType: 'room', targetId: room._id, details: { title: room.title, isActive: room.isActive } });
     res.json({ success: true, isActive: room.isActive, message: 'Status Updated' });
   } catch (error) { serverError(res, error, 'Toggle-status error'); }
 });
@@ -615,6 +618,7 @@ router.put('/:id/edit', requireAuth, upload.array('images', 6), sanitizeMultipar
     // jaisa tha waisa hi rehta hai; paid/renew flows alag admin verification use karte hain.
     await room.save();
     savedOk = true;
+    logAudit(req, { action: 'room.edit', targetType: 'room', targetId: room._id, details: { title: room.title, fields: Object.keys(req.body || {}).filter((k) => k !== 'images' && k !== 'keepImages').slice(0, 12) } });
     if (removedUrls.length > 0) await upload.destroyByUrls(removedUrls).catch(() => {}); // P1 #21
     res.status(200).json({
       success: true,
@@ -698,6 +702,7 @@ router.post('/:id/renew', requireAuth, async (req, res) => {
     room.paymentCode = cleanPayCode(paymentCode) || newPayCode();
     room.isApproved = false; // Dobara admin verification (payment check)
     await room.save();
+    logAudit(req, { action: 'room.renew_requested', targetType: 'room', targetId: room._id, details: { title: room.title, promoPlan } });
     res.json({ success: true, message: 'Renew request bheji gayi! Payment verify hote hi ad live hoga.', room });
   } catch (error) { serverError(res, error, 'Renew error'); }
 });
@@ -792,6 +797,7 @@ router.put('/:id/report-unavailable', requireAuth, async (req, res) => {
       count: updated.unavailableReportCount,
       hidden
     });
+    logAudit(req, { action: 'room.reported', targetType: 'room', targetId: req.params.id, actorRole: 'user', details: { count: updated.unavailableReportCount, hidden } });
   } catch (error) { serverError(res, error, 'Report error'); }
 });
 

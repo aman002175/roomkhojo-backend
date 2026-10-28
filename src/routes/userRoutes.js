@@ -253,6 +253,7 @@ router.post('/signup/verify-otp', otpVerifyLimiter, async (req, res) => {
     await newUser.save();
     ConsentLog.create({ emailHash: sha256(cleanEmail), termsVersion: TERMS_VERSION }).catch(() => {});
     await SignupRequest.deleteOne({ email: cleanEmail });
+    logAudit(req, { action: 'user.account_created', targetType: 'user', targetId: newUser._id, actorId: newUser._id, actorRole: 'user', details: { method: 'email-otp', name: newUser.name, email: cleanEmail } });
     const token = signUser(newUser);
     res.status(201).json({ success: true, message: 'Email verify ho gaya — account ban gaya!', token, user: publicUser(newUser) });
   } catch (error) {
@@ -312,6 +313,7 @@ router.post('/login', authLimiter, async (req, res) => {
       dirty = true;
     }
     if (dirty) await user.save();
+    logAudit(req, { action: 'user.login', targetType: 'user', targetId: user._id, actorId: user._id, actorRole: 'user', details: { method: 'password' } });
     const token = signUser(user);
     res.json({ success: true, message: `Welcome ${user.name}!`, token, user: publicUser(user) });
   } catch (error) {
@@ -355,6 +357,7 @@ router.post('/google', authLimiter, async (req, res) => {
         termsVersion: TERMS_VERSION
       });
       ConsentLog.create({ emailHash: sha256(googleEmail), termsVersion: TERMS_VERSION }).catch(() => {});
+      logAudit(req, { action: 'user.account_created', targetType: 'user', targetId: user._id, actorId: user._id, actorRole: 'user', details: { method: 'google', name: user.name, email: googleEmail } });
     } else {
       const blockedMsg = accountBlockMessage(user);
       if (blockedMsg) return res.status(403).json({ success: false, message: blockedMsg });
@@ -369,6 +372,7 @@ router.post('/google', authLimiter, async (req, res) => {
       await user.save();
     }
 
+    logAudit(req, { action: 'user.login', targetType: 'user', targetId: user._id, actorId: user._id, actorRole: 'user', details: { method: 'google' } });
     const token = signUser(user);
     res.json({ success: true, message: 'Google Login Successful!', token, user: publicUser(user) });
   } catch (error) {
@@ -537,6 +541,7 @@ router.post('/change-password', requireAuth, async (req, res) => {
     user.password = newPassword;
     user.tokenVersion = (user.tokenVersion || 0) + 1;
     await user.save();
+    logAudit(req, { action: 'user.password_changed', targetType: 'user', targetId: user._id, actorRole: 'user', details: {} });
     res.json({ success: true, message: 'Password update ho gaya hai.' });
   } catch (error) {
     console.error('Change-password error:', error.message);
@@ -634,6 +639,7 @@ router.post('/change-email/verify', otpVerifyLimiter, requireAuth, async (req, r
     user.tokenVersion = (user.tokenVersion || 0) + 1;
     await user.save();
     await ActionOtp.deleteOne({ userId: user._id, purpose: 'email-change' });
+    logAudit(req, { action: 'user.email_changed', targetType: 'user', targetId: user._id, actorRole: 'user', details: { newEmail: cleanEmail } });
     const token = signUser(user);
     res.json({ success: true, message: 'Email verify ho gaya aur update ho gaya!', token, user: publicUser(user) });
   } catch (error) {

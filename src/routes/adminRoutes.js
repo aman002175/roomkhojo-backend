@@ -11,6 +11,8 @@ const Favorite = require('../models/Favorite');
 const ActionOtp = require('../models/ActionOtp');
 const SignupRequest = require('../models/SignupRequest');
 const ConsentLog = require('../models/ConsentLog');
+const AuditLog = require('../models/AuditLog');
+const ContactReveal = require('../models/ContactReveal');
 const { signAdmin, requireAdmin } = require('../middleware/auth');
 const { cleanText, passwordProblem } = require('../utils/security');
 const { logAudit, archiveRooms } = require('../utils/audit');
@@ -443,12 +445,26 @@ router.get('/users', requireAdmin, async (req, res) => {
       .limit(limit)
       .lean();
     const ids = users.map((u) => String(u._id));
-    const counts = await Room.aggregate([
-      { $match: { userId: { $in: ids } } },
-      { $group: { _id: '$userId', count: { $sum: 1 } } }
+    const [counts, revealCounts, favCounts] = await Promise.all([
+      Room.aggregate([
+        { $match: { userId: { $in: ids } } },
+        { $group: { _id: '$userId', count: { $sum: 1 }, lastAt: { $max: '$createdAt' } } }
+      ]),
+      ContactReveal.aggregate([
+        { $match: { userId: { $in: ids } } },
+        { $group: { _id: '$userId', count: { $sum: 1 } } }
+      ]),
+      Favorite.aggregate([
+        { $match: { userId: { $in: ids } } },
+        { $group: { _id: '$userId', count: { $sum: 1 } } }
+      ])
     ]);
     const countMap = {};
-    counts.forEach((c) => { countMap[String(c._id)] = c.count; });
+    counts.forEach((c) => { countMap[String(c._id)] = { count: c.count, lastAt: c.lastAt || null }; });
+    const revealMap = {};
+    revealCounts.forEach((c) => { revealMap[String(c._id)] = c.count; });
+    const favMap = {};
+    favCounts.forEach((c) => { favMap[String(c._id)] = c.count; });
     res.json({
       success: true,
       total,
@@ -464,7 +480,10 @@ router.get('/users', requireAdmin, async (req, res) => {
         status: u.status || 'active',
         statusReason: u.statusReason || '',
         createdAt: u.createdAt,
-        listingCount: countMap[String(u._id)] || 0
+        listingCount: (countMap[String(u._id)] && countMap[String(u._id)].count) || 0,
+        lastListingAt: (countMap[String(u._id)] && countMap[String(u._id)].lastAt) || null,
+        revealCount: revealMap[String(u._id)] || 0,
+        favoriteCount: favMap[String(u._id)] || 0
       }))
     });
   } catch (error) {
@@ -473,21 +492,117 @@ router.get('/users', requireAdmin, async (req, res) => {
   }
 });
 
-// --- ADMIN: ek user ki profile + uske saare listings ---
+// --- ADMIN: activity feed (signup, login, listing, reveal, moderation — sab ek jagah) ---
+// Actor/target ka naam dena zaroori hai (AuditLog me sirf id hoti hai) — batch lookup.
+const hydrateActivity = async (logs) => {
+  const userIds = new Set();
+  const roomIds = new Set();
+  logs.forEach((l) => {
+    if (l.actorId && mongoose.isValidObjectId(l.actorId)) userIds.add(String(l.actorId));
+    if (l.targetType === 'user' && l.targetId && mongoose.isValidObjectId(l.targetId)) userIds.add(String(l.targetId));
+    if (l.targetType === 'room' && l.targetId && mongoose.isValidObjectId(l.targetId)) roomIds.add(String(l.targetId));
+    if (l.details && l.details.ownerUserId && mongoose.isValidObjectId(l.details.ownerUserId)) userIds.add(String(l.details.ownerUserId));
+  });
+  const [users, rooms] = await Promise.all([
+    userIds.size ? User.find({ _id: { $in: [...userIds] } }).select('name email').lean() : [],
+    roomIds.size ? Room.find({ _id: { $in: [...roomIds] } }).select('title').lean() : []
+  ]);
+  const userMap = {};
+  users.forEach((u) => { userMap[String(u._id)] = { name: u.name, email: u.email }; });
+  const roomMap = {};
+  rooms.forEach((r) => { roomMap[String(r._id)] = r.title; });
+  return logs.map((l) => {
+    const actor = userMap[String(l.actorId)] || null;
+    let targetName = '';
+    if (l.targetType === 'user') targetName = (userMap[String(l.targetId)] || {}).name || '';
+    else if (l.targetType === 'room') targetName = roomMap[String(l.targetId)] || (l.details && l.details.title) || '';
+    const owner = l.details && l.details.ownerUserId ? userMap[String(l.details.ownerUserId)] : null;
+    return {
+      id: l._id,
+      action: l.action,
+      actorRole: l.actorRole,
+      actorId: l.actorId,
+      actorName: actor ? actor.name : (l.actorRole === 'admin' ? 'Admin' : l.actorRole === 'system' ? 'System' : ''),
+      actorEmail: actor ? actor.email : '',
+      targetType: l.targetType,
+      targetId: l.targetId,
+      targetName,
+      ownerName: owner ? owner.name : '',
+      details: l.details || {},
+      createdAt: l.createdAt
+    };
+  });
+};
+
+// GET /api/admin/activity?limit=50&action=user.account_created&actorId=<id>&days=30
+router.get('/activity', requireAdmin, async (req, res) => {
+  try {
+    const limit = Math.min(200, Math.max(10, parseInt(req.query.limit, 10) || 50));
+    const filter = {};
+    const action = String(req.query.action || '').trim().slice(0, 80);
+    if (action) filter.action = action;
+    const actorId = String(req.query.actorId || '').trim();
+    if (actorId) filter.actorId = actorId;
+    const targetId = String(req.query.targetId || '').trim();
+    if (targetId) filter.targetId = targetId;
+    const days = parseInt(req.query.days, 10);
+    if (Number.isFinite(days) && days > 0) {
+      filter.createdAt = { $gte: new Date(Date.now() - Math.min(365, days) * 24 * 60 * 60 * 1000) };
+    }
+    const [total, logs] = await Promise.all([
+      AuditLog.countDocuments(filter),
+      AuditLog.find(filter).sort({ createdAt: -1 }).limit(limit).lean()
+    ]);
+    const items = await hydrateActivity(logs);
+    res.json({ success: true, total, items });
+  } catch (error) {
+    console.error('Admin activity error:', error.message);
+    res.status(500).json({ success: false, message: 'Activity feed load nahi hui. Baad me try karein.' });
+  }
+});
+
+// --- ADMIN: ek user ki profile + uske saare listings + activity ---
 router.get('/users/:id', requireAdmin, async (req, res) => {
   try {
     if (!mongoose.isValidObjectId(req.params.id)) {
       return res.status(404).json({ success: false, message: 'User nahi mila.' });
     }
+    const uid = String(req.params.id);
     const user = await User.findById(req.params.id)
       .select('name email phone profilePic isGoogleUser status statusReason statusChangedAt createdAt termsAcceptedAt termsVersion')
       .lean();
     if (!user) return res.status(404).json({ success: false, message: 'User nahi mila.' });
-    const rooms = await Room.find({ userId: req.params.id })
-      .select('title price type category listingType landmark mobile image images isApproved isActive isPromoted promoPlan createdAt')
-      .sort({ createdAt: -1 })
-      .limit(200)
-      .lean();
+
+    // Aaj ka IST din (reveal daily-usage ke liye)
+    const istToday = new Date(Date.now() + 5.5 * 60 * 60 * 1000).toISOString().slice(0, 10);
+
+    const [rooms, revealsTotal, revealsToday, favoritesTotal, activityLogs, revealLogs] = await Promise.all([
+      Room.find({ userId: uid })
+        .select('title price type category listingType landmark mobile image images isApproved isActive isPromoted promoPlan createdAt views')
+        .sort({ createdAt: -1 })
+        .limit(200)
+        .lean(),
+      ContactReveal.countDocuments({ userId: uid }),
+      ContactReveal.countDocuments({ userId: uid, date: istToday }),
+      Favorite.countDocuments({ userId: uid }),
+      // Is user ki apni activity (login, signup, listing, reveal, status changes)
+      AuditLog.find({ $or: [{ actorId: uid }, { targetId: uid }] })
+        .sort({ createdAt: -1 })
+        .limit(40)
+        .lean(),
+      // Kin numbers ko reveal kiya (room titles ke saath)
+      ContactReveal.find({ userId: uid }).sort({ createdAt: -1 }).limit(30).lean()
+    ]);
+
+    const roomIds = [...new Set(revealLogs.map((r) => String(r.roomId)).filter((id) => mongoose.isValidObjectId(id)))];
+    const revealRooms = roomIds.length
+      ? await Room.find({ _id: { $in: roomIds } }).select('title price landmark image').lean()
+      : [];
+    const revealRoomMap = {};
+    revealRooms.forEach((r) => { revealRoomMap[String(r._id)] = r; });
+
+    const activity = await hydrateActivity(activityLogs);
+
     res.json({
       success: true,
       user: {
@@ -509,8 +624,24 @@ router.get('/users/:id', requireAdmin, async (req, res) => {
         total: rooms.length,
         live: rooms.filter((r) => r.isApproved && r.isActive).length,
         pending: rooms.filter((r) => !r.isApproved).length,
-        services: rooms.filter((r) => r.listingType === 'service').length
-      }
+        services: rooms.filter((r) => r.listingType === 'service').length,
+        views: rooms.reduce((s, r) => s + (Number(r.views) || 0), 0),
+        revealsTotal,
+        revealsToday,
+        favoritesTotal
+      },
+      activity,
+      reveals: revealLogs.map((r) => {
+        const room = revealRoomMap[String(r.roomId)] || null;
+        return {
+          id: r._id,
+          roomId: r.roomId,
+          roomTitle: room ? room.title : '(ad delete ho gaya)',
+          roomPrice: room ? room.price : null,
+          date: r.date,
+          createdAt: r.createdAt
+        };
+      })
     });
   } catch (error) {
     console.error('Admin user detail error:', error.message);
